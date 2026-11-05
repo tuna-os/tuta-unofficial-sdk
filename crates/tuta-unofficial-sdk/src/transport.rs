@@ -7,7 +7,10 @@
 //! With diagnostics on it also traces every request as method, service path
 //! and status -- never the query, the body or the ids in the path.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use tutasdk::bindings::rest_client::{
     HttpMethod, RestClient, RestClientError, RestClientOptions, RestResponse,
@@ -20,7 +23,7 @@ const SUBMIT_PATH: &str = "/rest/tutanota/senddraftservice";
 
 /// What the submit request is known to have done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Submit {
+pub(crate) enum Submit {
     /// Never left the process: nothing can have been delivered.
     NotSent,
     /// Handed to the HTTP client, but no status came back.
@@ -29,20 +32,44 @@ pub enum Submit {
     Answered(u32),
 }
 
-/// One helper process runs one request, so a process-wide record is exact.
-static SUBMIT: Mutex<Submit> = Mutex::new(Submit::NotSent);
+/// What one send's submit did on the wire. Each send runs inside its own
+/// [`SubmitRecord::scope`], so concurrent sends over one client never see
+/// each other's submit.
+#[derive(Clone)]
+pub(crate) struct SubmitRecord(Arc<Mutex<Submit>>);
 
-/// What the submit has done so far.
-pub fn submit() -> Submit {
-    *SUBMIT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+tokio::task_local! {
+    static SUBMIT: SubmitRecord;
+}
+
+impl SubmitRecord {
+    pub(crate) fn new() -> Self {
+        SubmitRecord(Arc::new(Mutex::new(Submit::NotSent)))
+    }
+
+    /// What the submit has done so far.
+    pub(crate) fn get(&self) -> Submit {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set(&self, state: Submit) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    }
+
+    /// Run `future` with every submit it makes recorded here.
+    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
+        SUBMIT.scope(self.clone(), future).await
+    }
 }
 
 fn record(state: Submit) {
-    *SUBMIT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    let _ = SUBMIT.try_with(|submit| submit.set(state));
 }
 
 /// `/rest/<app>/<service or type>` of a request URL: no host, query or ids.
@@ -54,7 +81,7 @@ fn service_path(url: &str) -> String {
     path.split('/').take(4).collect::<Vec<_>>().join("/")
 }
 
-pub struct Traced(pub Arc<dyn RestClient>);
+pub(crate) struct Traced(pub(crate) Arc<dyn RestClient>);
 
 #[async_trait::async_trait]
 impl RestClient for Traced {
@@ -153,34 +180,58 @@ mod tests {
             .await;
     }
 
-    // The only test touching the process-wide record, so it runs in sequence.
     #[tokio::test]
     async fn the_submit_status_is_recorded_from_the_wire() {
         let submit_url = "https://app.tuta.com/rest/tutanota/senddraftservice";
+        let record = SubmitRecord::new();
+        let submit = || record.get();
         assert_eq!(submit(), Submit::NotSent);
-        call(
-            Ok(200),
-            HttpMethod::POST,
-            "https://app.tuta.com/rest/tutanota/draftservice",
-        )
-        .await;
-        call(Ok(200), HttpMethod::DELETE, submit_url).await;
+        record
+            .scope(async {
+                call(
+                    Ok(200),
+                    HttpMethod::POST,
+                    "https://app.tuta.com/rest/tutanota/draftservice",
+                )
+                .await;
+                call(Ok(200), HttpMethod::DELETE, submit_url).await;
+            })
+            .await;
         assert_eq!(submit(), Submit::NotSent);
-        call(Ok(412), HttpMethod::POST, submit_url).await;
+        record
+            .scope(call(Ok(412), HttpMethod::POST, submit_url))
+            .await;
         assert_eq!(submit(), Submit::Answered(412));
-        call(
-            Err(RestClientError::NetworkError),
-            HttpMethod::POST,
-            submit_url,
-        )
-        .await;
+        record
+            .scope(call(
+                Err(RestClientError::NetworkError),
+                HttpMethod::POST,
+                submit_url,
+            ))
+            .await;
         assert_eq!(submit(), Submit::NoStatus);
-        call(
-            Err(RestClientError::InvalidURL),
-            HttpMethod::POST,
-            submit_url,
-        )
-        .await;
+        record
+            .scope(call(
+                Err(RestClientError::InvalidURL),
+                HttpMethod::POST,
+                submit_url,
+            ))
+            .await;
         assert_eq!(submit(), Submit::NotSent);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_keep_their_own_record() {
+        let submit_url = "https://app.tuta.com/rest/tutanota/senddraftservice";
+        let (first, second) = (SubmitRecord::new(), SubmitRecord::new());
+        tokio::join!(
+            first.scope(call(Ok(201), HttpMethod::POST, submit_url)),
+            second.scope(call(Ok(503), HttpMethod::POST, submit_url)),
+        );
+        assert_eq!(first.get(), Submit::Answered(201));
+        assert_eq!(second.get(), Submit::Answered(503));
+        // Outside any send nothing is recorded, and nothing fails.
+        call(Ok(500), HttpMethod::POST, submit_url).await;
+        assert_eq!(first.get(), Submit::Answered(201));
     }
 }

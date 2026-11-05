@@ -944,24 +944,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "hylki-tuta"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "crypto-primitives",
- "libc",
- "mail-parser",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "tokio",
- "tuta-sdk",
- "tutabridge-tuta",
- "zeroize",
-]
-
-[[package]]
 name = "hyper"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1799,6 +1781,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2405,6 +2397,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuta-helper"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures-core",
+ "libc",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tuta-unofficial-sdk",
+]
+
+[[package]]
 name = "tuta-sdk"
 version = "362.261020.0"
 dependencies = [
@@ -2445,6 +2451,25 @@ dependencies = [
  "uniffi",
  "util",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "tuta-unofficial-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "crypto-primitives",
+ "futures-core",
+ "mail-parser",
+ "rand_core 0.6.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tuta-sdk",
+ "tutabridge-tuta",
  "zeroize",
 ]
 

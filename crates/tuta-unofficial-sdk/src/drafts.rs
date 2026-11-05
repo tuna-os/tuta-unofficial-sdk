@@ -1,27 +1,32 @@
 //! Server-side drafts: create or update one (`DraftService` POST/PUT), and
 //! discard one. Mirrors TS `MailFacade.createDraft`/`updateDraft` and the
 //! official client's discard (into Trash, then deleted from there).
-use super::{
-    diag, draft_payload, draft_recipients, encrypted_name, id, normalise_mime, resume,
-    thread::{Action, Thread},
-    trash_and_sent, tuple, valid_address, Result, SendAttachment, SendRecipient, Session,
-    MAX_BODY_BYTES,
+//!
+//! An update replaces the draft's recipients, subject, body and its whole
+//! attachment set, wherever the draft is filed (a template folder works).
+//! Both operations refuse any id that is not a draft, and both treat a
+//! draft that is already gone as done.
+use crate::{
+    diag,
+    error::api_code,
+    ids::Id,
+    send::{
+        draft_payload, normalise_mime, trash_and_sent, valid_address, DraftContent,
+        OutgoingAttachment, Recipient, MAX_BODY_BYTES,
+    },
+    thread::Thread,
+    Error, Result, Session,
 };
-use crate::mailbox_ops::api_code;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use crypto_primitives::{
     aes::{Aes256Key, InitializationVector},
     key::GenericAesKey,
     randomizer_facade::RandomizerFacade,
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
 use tutabridge_tuta::mail::MailExtensions;
 use tutasdk::{
     blobs::blob_facade::FileData,
     entities::generated::tutanota::{
-        DraftAttachment, DraftCreateData, DraftUpdateData, EncryptedMailAddress, Mail,
-        MoveMailData, NewDraftAttachment,
+        DraftAttachment, DraftCreateData, DraftUpdateData, Mail, MoveMailData, NewDraftAttachment,
     },
     rest_error::HttpError,
     services::{
@@ -29,66 +34,58 @@ use tutasdk::{
         ExtraServiceParams,
     },
     tutanota_constants::ArchiveDataType,
-    ApiCallError, GeneratedId, IdTupleGenerated, LoggedInSdk, Sdk,
+    ApiCallError, GeneratedId, IdTupleGenerated, LoggedInSdk,
 };
 
 /// TS `MailState.DRAFT`.
 const MAIL_STATE_DRAFT: i64 = 0;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SaveDraft {
-    pub session: Session,
-    /// The draft to update; absent creates a new one.
-    draft_id: Option<String>,
-    sender: String,
-    sender_name: String,
-    to: Vec<SendRecipient>,
-    cc: Vec<SendRecipient>,
-    bcc: Vec<SendRecipient>,
-    reply_tos: Vec<SendRecipient>,
-    subject: String,
-    body_html: String,
+/// A draft to create, or to update when `draft` names one.
+#[derive(Debug)]
+pub struct DraftRequest {
+    /// The draft to update; None creates a new one in Drafts.
+    pub draft: Option<Id>,
+    pub sender: String,
+    pub sender_name: String,
+    pub to: Vec<Recipient>,
+    pub cc: Vec<Recipient>,
+    pub bcc: Vec<Recipient>,
+    pub reply_tos: Vec<Recipient>,
+    pub subject: String,
+    pub body_html: String,
     /// The draft's own end-to-end flag, as the official composer stores it.
-    confidential: bool,
+    pub confidential: bool,
     /// The draft's complete attachment set: an update replaces the stored
     /// files with these.
-    attachments: Vec<SendAttachment>,
-    /// The parent's Message-ID, for a reply or forward (see `thread`). A
-    /// draft's conversation is fixed when it is created: on an update these
-    /// are checked and otherwise unused, as `DraftUpdateData` has no place
-    /// for them.
-    in_reply_to: Option<String>,
-    /// Whitespace-separated Message-IDs, oldest first.
-    references: Option<String>,
-    action: Option<Action>,
+    pub attachments: Vec<OutgoingAttachment>,
+    /// Its place in a conversation, fixed when the draft is created: an
+    /// update has nowhere to put it.
+    pub thread: Thread,
 }
 
-/// Request checks made before any I/O. A draft may have no recipient yet,
-/// but every address it does carry must be one, and every Message-ID too.
-fn validate(request: &SaveDraft) -> Result<(Option<IdTupleGenerated>, Thread)> {
-    let addresses = request
-        .to
-        .iter()
-        .chain(&request.cc)
-        .chain(&request.bcc)
-        .chain(&request.reply_tos);
-    if addresses
-        .map(|r| r.address.as_str())
-        .any(|a| !valid_address(a))
-    {
-        return Err("invalid_recipient");
+impl DraftRequest {
+    /// The checks [`save`] makes before any I/O. A draft may have no
+    /// recipient yet, but every address it does carry must be one
+    /// ([`Error::InvalidRecipient`]), and its body is at most 1 MiB
+    /// ([`Error::BodyTooLarge`]).
+    pub fn check(&self) -> Result<()> {
+        let addresses = self
+            .to
+            .iter()
+            .chain(&self.cc)
+            .chain(&self.bcc)
+            .chain(&self.reply_tos);
+        if addresses
+            .map(|r| r.address.as_str())
+            .any(|a| !valid_address(a))
+        {
+            return Err(Error::InvalidRecipient);
+        }
+        if self.body_html.len() > MAX_BODY_BYTES {
+            return Err(Error::BodyTooLarge);
+        }
+        Ok(())
     }
-    if request.body_html.len() > MAX_BODY_BYTES {
-        return Err("body_too_large");
-    }
-    let thread = Thread::of(
-        request.in_reply_to.as_deref(),
-        request.references.as_deref(),
-        request.action,
-    )?;
-    let draft = request.draft_id.as_deref().map(tuple).transpose()?;
-    Ok((draft, thread))
 }
 
 /// The sender's mail group: one of the account's own addresses, as in send.
@@ -98,56 +95,51 @@ async fn sender_group(sdk: &LoggedInSdk, sender: &str) -> Result<GeneratedId> {
         .await
         .map_err(|error| {
             diag::failed("sender lookup", &error);
-            api_code(error, "draft_failed", "sender_unknown")
+            api_code(error, Error::DraftFailed, Error::SenderUnknown)
         })
 }
 
 /// Upload the attachments and describe them for `DraftData.addedAttachments`,
 /// each file key wrapped with the mail group key, as TS
 /// `_createAddedAttachments` does for new files.
-pub(crate) async fn stage_attachments(
+async fn stage_attachments(
     sdk: &LoggedInSdk,
     mail_group: &GeneratedId,
     group_key: &GenericAesKey,
     group_key_version: u64,
-    attachments: &[SendAttachment],
+    attachments: &[OutgoingAttachment],
 ) -> Result<Vec<DraftAttachment>> {
     if attachments.is_empty() {
         // No upload at all: the SDK would still fetch a write token.
         return Ok(Vec::new());
     }
     let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
-    let mut staged = Vec::with_capacity(attachments.len());
-    for attachment in attachments {
-        let bytes = STANDARD
-            .decode(attachment.data.as_bytes())
-            .map_err(|_| "attachment_failed")?;
-        staged.push((
-            bytes,
-            GenericAesKey::Aes256(Aes256Key::generate(&randomizer)),
-        ));
-    }
-    let file_data: Vec<FileData> = staged
+    let keys: Vec<GenericAesKey> = attachments
         .iter()
-        .map(|(bytes, key)| FileData {
+        .map(|_| GenericAesKey::Aes256(Aes256Key::generate(&randomizer)))
+        .collect();
+    let file_data: Vec<FileData> = attachments
+        .iter()
+        .zip(&keys)
+        .map(|(attachment, key)| FileData {
             session_key: key.clone(),
-            data: bytes,
+            data: &attachment.data,
         })
         .collect();
     let tokens = sdk
         .blob_facade()
         .encrypt_and_upload_multiple(ArchiveDataType::Attachments, mail_group, file_data.iter())
         .await
-        .map_err(diag::fail("blob upload", "attachment_failed"))?;
-    if tokens.len() != staged.len() {
-        return Err("attachment_failed");
+        .map_err(diag::fail("blob upload", Error::AttachmentFailed))?;
+    if tokens.len() != attachments.len() {
+        return Err(Error::AttachmentFailed);
     }
-    let version = i64::try_from(group_key_version).map_err(|_| "draft_failed")?;
-    let mut added = Vec::with_capacity(staged.len());
-    for ((attachment, (_, key)), tokens) in attachments.iter().zip(&staged).zip(tokens) {
+    let version = i64::try_from(group_key_version).map_err(|_| Error::DraftFailed)?;
+    let mut added = Vec::with_capacity(attachments.len());
+    for ((attachment, key), tokens) in attachments.iter().zip(&keys).zip(tokens) {
         let encrypt = |text: &[u8]| {
             key.encrypt_data(text, InitializationVector::generate(&randomizer))
-                .map_err(|_| "attachment_failed")
+                .map_err(|_| Error::AttachmentFailed)
         };
         let (main, sub) = normalise_mime(&attachment.mime_type);
         added.push(DraftAttachment {
@@ -172,18 +164,6 @@ pub(crate) async fn stage_attachments(
     Ok(added)
 }
 
-fn reply_addresses(reply_tos: &[SendRecipient]) -> Vec<EncryptedMailAddress> {
-    reply_tos
-        .iter()
-        .map(|r| EncryptedMailAddress {
-            _id: None,
-            name: encrypted_name(&r.name, &r.address),
-            address: r.address.clone(),
-            _errors: Default::default(),
-        })
-        .collect()
-}
-
 /// Load a stored draft, refusing anything that is not one: an id that
 /// names a received or sent mail must never be overwritten or discarded.
 async fn load_draft(sdk: &LoggedInSdk, draft: &IdTupleGenerated) -> Result<Mail> {
@@ -194,13 +174,13 @@ async fn load_draft(sdk: &LoggedInSdk, draft: &IdTupleGenerated) -> Result<Mail>
         .await
         .map_err(|error| {
             diag::failed("draft load", &error);
-            api_code(error, "draft_failed", "draft_not_found")
+            api_code(error, Error::DraftFailed, Error::DraftNotFound)
         })?;
     if !mail._errors.is_empty() {
-        return Err("decryption_failed");
+        return Err(Error::DecryptionFailed);
     }
     if mail.state != MAIL_STATE_DRAFT || mail.mailDetailsDraft.is_none() {
-        return Err("not_a_draft");
+        return Err(Error::NotADraft);
     }
     Ok(mail)
 }
@@ -208,11 +188,11 @@ async fn load_draft(sdk: &LoggedInSdk, draft: &IdTupleGenerated) -> Result<Mail>
 /// The draft's group key at the version it was written with and the draft's
 /// session key under it, as TS `updateDraft` derives them.
 async fn draft_keys(sdk: &LoggedInSdk, mail: &Mail) -> Result<(GenericAesKey, u64, GenericAesKey)> {
-    let group = mail._ownerGroup.as_ref().ok_or("incomplete_response")?;
+    let group = mail._ownerGroup.as_ref().ok_or(Error::IncompleteResponse)?;
     let encrypted = mail
         ._ownerEncSessionKey
         .as_ref()
-        .ok_or("incomplete_response")?;
+        .ok_or(Error::IncompleteResponse)?;
     let version = mail._ownerKeyVersion.unwrap_or(0).unsigned_abs();
     let group_key = sdk
         .mail_facade()
@@ -223,55 +203,45 @@ async fn draft_keys(sdk: &LoggedInSdk, mail: &Mail) -> Result<(GenericAesKey, u6
         .await
         .map_err(|error| {
             diag::failed("draft group key", &error);
-            "draft_failed"
+            Error::DraftFailed
         })?;
     let session_key = group_key.decrypt_aes_key(encrypted).map_err(|error| {
         diag::failed("draft session key", &error);
-        "decryption_failed"
+        Error::DecryptionFailed
     })?;
     Ok((group_key, version, session_key))
 }
 
-pub(crate) async fn save_draft(sdk: &Sdk, request: SaveDraft) -> Result<Value> {
-    let (existing, thread) = validate(&request)?;
-    let sdk = resume(sdk, request.session).await?;
-    let group = sender_group(&sdk, &request.sender).await?;
-    let SaveDraft {
-        sender,
-        sender_name,
-        to,
-        cc,
-        bcc,
-        reply_tos,
-        subject,
-        body_html,
-        confidential,
-        attachments,
-        ..
-    } = request;
+/// Create a draft in Drafts, or update the given one; returns its id.
+pub async fn save(session: &Session, request: &DraftRequest) -> Result<Id> {
+    request.check()?;
+    let sdk = &session.sdk;
+    let group = sender_group(sdk, &request.sender).await?;
+    let content = DraftContent {
+        subject: &request.subject,
+        body_html: &request.body_html,
+        sender: &request.sender,
+        sender_name: &request.sender_name,
+        to: &request.to,
+        cc: &request.cc,
+        bcc: &request.bcc,
+        reply_tos: &request.reply_tos,
+    };
     let payload = |added: Vec<DraftAttachment>| {
-        let mut data = draft_payload(
-            subject.clone(),
-            body_html.clone(),
-            sender.clone(),
-            sender_name.clone(),
-            draft_recipients(&to),
-            draft_recipients(&cc),
-            draft_recipients(&bcc),
-            reply_addresses(&reply_tos),
-            added,
-        );
-        data.confidential = confidential;
+        let mut data = draft_payload(&content, added);
+        data.confidential = request.confidential;
         data
     };
-    if let Some(draft) = existing {
-        let mail = load_draft(&sdk, &draft).await?;
+    if let Some(draft) = &request.draft {
+        let draft = draft.tuple();
+        let mail = load_draft(sdk, draft).await?;
         if mail._ownerGroup.as_ref() != Some(&group) {
             // The sender moved to another mailbox: the draft stays where it is.
-            return Err("sender_unknown");
+            return Err(Error::SenderUnknown);
         }
-        let (group_key, version, session_key) = draft_keys(&sdk, &mail).await?;
-        let added = stage_attachments(&sdk, &group, &group_key, version, &attachments).await?;
+        let (group_key, version, session_key) = draft_keys(sdk, &mail).await?;
+        let added =
+            stage_attachments(sdk, &group, &group_key, version, &request.attachments).await?;
         let mut data = payload(added);
         // The attachment set is replaced: every stored file goes, the given
         // ones come (TS `_getRemovedAttachments` with only new files).
@@ -293,20 +263,20 @@ pub(crate) async fn save_draft(sdk: &Sdk, request: SaveDraft) -> Result<Value> {
             .await
             .map_err(|error| {
                 diag::failed("draft update (DraftService put)", &error);
-                api_code(error, "draft_failed", "draft_not_found")
+                api_code(error, Error::DraftFailed, Error::DraftNotFound)
             })?;
-        return Ok(json!({"id": id(&draft)}));
+        return Ok(Id::from_tuple(draft.clone()));
     }
     let group_key = sdk
         .get_current_sym_group_key(&group)
         .await
-        .map_err(diag::fail("draft group key", "draft_failed"))?;
+        .map_err(diag::fail("draft group key", Error::DraftFailed))?;
     let added = stage_attachments(
-        &sdk,
+        sdk,
         &group,
         &group_key.object,
         group_key.version,
-        &attachments,
+        &request.attachments,
     )
     .await?;
     let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
@@ -318,10 +288,11 @@ pub(crate) async fn save_draft(sdk: &Sdk, request: SaveDraft) -> Result<Value> {
         .post::<DraftService>(
             DraftCreateData {
                 _format: 0,
-                previousMessageId: thread.parent,
-                conversationType: thread.conversation_type,
+                previousMessageId: request.thread.parent.clone(),
+                conversationType: request.thread.conversation_type,
                 ownerEncSessionKey: owner_enc.object,
-                ownerKeyVersion: i64::try_from(owner_enc.version).map_err(|_| "draft_failed")?,
+                ownerKeyVersion: i64::try_from(owner_enc.version)
+                    .map_err(|_| Error::DraftFailed)?,
                 draftData: payload(added),
                 _errors: Default::default(),
             },
@@ -333,30 +304,23 @@ pub(crate) async fn save_draft(sdk: &Sdk, request: SaveDraft) -> Result<Value> {
         .await
         .map_err(|error| {
             diag::failed("draft create (DraftService post)", &error);
-            api_code(error, "draft_failed", "draft_failed")
+            api_code(error, Error::DraftFailed, Error::DraftFailed)
         })?;
-    Ok(json!({"id": id(&created.draft)}))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DeleteDraft {
-    pub session: Session,
-    id: String,
+    Ok(Id::from_tuple(created.draft))
 }
 
 /// Discard a draft the way the official client does: into Trash (never
 /// out of Sent), then deleted for good from there. A draft that is already
 /// gone counts as discarded.
-pub(crate) async fn delete_draft(sdk: &Sdk, request: DeleteDraft) -> Result<Value> {
-    let draft = tuple(&request.id)?;
-    let sdk = resume(sdk, request.session).await?;
-    match load_draft(&sdk, &draft).await {
+pub async fn delete(session: &Session, draft_id: &Id) -> Result<()> {
+    let sdk = &session.sdk;
+    let draft = draft_id.tuple().clone();
+    match load_draft(sdk, &draft).await {
         Ok(_) => {}
-        Err("draft_not_found") => return Ok(json!({})),
+        Err(Error::DraftNotFound) => return Ok(()),
         Err(code) => return Err(code),
     }
-    let (trash, sent) = trash_and_sent(&sdk).await.ok_or("draft_failed")?;
+    let (trash, sent) = trash_and_sent(sdk).await.ok_or(Error::DraftFailed)?;
     sdk.get_service_executor()
         .post::<MoveMailService>(
             MoveMailData {
@@ -371,19 +335,19 @@ pub(crate) async fn delete_draft(sdk: &Sdk, request: DeleteDraft) -> Result<Valu
         .await
         .map_err(|error| {
             diag::failed("draft discard (move to trash)", &error);
-            api_code(error, "draft_failed", "draft_failed")
+            api_code(error, Error::DraftFailed, Error::DraftFailed)
         })?;
-    match MailExtensions::new(sdk)
+    match MailExtensions::new(sdk.clone())
         .delete_mails(vec![draft], trash)
         .await
     {
         Ok(())
         | Err(ApiCallError::ServerResponseError {
             source: HttpError::NotFoundError,
-        }) => Ok(json!({})),
+        }) => Ok(()),
         Err(error) => {
             diag::failed("draft discard (delete from trash)", &error);
-            Err(api_code(error, "draft_failed", "draft_failed"))
+            Err(api_code(error, Error::DraftFailed, Error::DraftFailed))
         }
     }
 }
@@ -392,66 +356,40 @@ pub(crate) async fn delete_draft(sdk: &Sdk, request: DeleteDraft) -> Result<Valu
 mod tests {
     use super::*;
 
-    fn request(extra: Value) -> serde_json::Result<SaveDraft> {
-        let mut base = json!({
-            "session": {"login": "", "user_id": "", "access_token": "", "encrypted_passphrase_key": []},
-            "sender": "me@example.org", "sender_name": "", "to": [], "cc": [], "bcc": [],
-            "reply_tos": [], "subject": "", "body_html": "", "confidential": false,
-            "attachments": [],
-        });
-        base.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        serde_json::from_value(base)
+    fn request() -> DraftRequest {
+        DraftRequest {
+            draft: None,
+            sender: "me@example.org".into(),
+            sender_name: String::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_tos: Vec::new(),
+            subject: String::new(),
+            body_html: String::new(),
+            confidential: false,
+            attachments: Vec::new(),
+            thread: Thread::default(),
+        }
     }
 
     #[test]
     fn a_draft_needs_no_recipient_but_valid_addresses() {
-        assert_eq!(
-            validate(&request(json!({})).unwrap()).map(|(d, _)| d),
-            Ok(None)
-        );
-        let bad = request(json!({"cc": [{"name": "", "address": "nope"}]})).unwrap();
-        assert_eq!(validate(&bad).err(), Some("invalid_recipient"));
-        let bad_reply = request(json!({"reply_tos": [{"name": "", "address": "a b@c"}]})).unwrap();
-        assert_eq!(validate(&bad_reply).err(), Some("invalid_recipient"));
+        assert_eq!(request().check(), Ok(()));
+        let mut bad = request();
+        bad.cc.push(Recipient::new("", "nope"));
+        assert_eq!(bad.check(), Err(Error::InvalidRecipient));
+        let mut bad_reply = request();
+        bad_reply.reply_tos.push(Recipient::new("", "a b@c"));
+        assert_eq!(bad_reply.check(), Err(Error::InvalidRecipient));
     }
 
     #[test]
-    fn a_draft_id_and_body_are_checked() {
-        let update = request(json!({"draft_id": "list/elem"})).unwrap();
-        assert_eq!(
-            validate(&update).unwrap().0.map(|d| id(&d)),
-            Some("list/elem".into())
-        );
-        let bad = request(json!({"draft_id": "elem"})).unwrap();
-        assert_eq!(validate(&bad).err(), Some("invalid_id"));
-        let big = request(json!({"body_html": "x".repeat(MAX_BODY_BYTES + 1)})).unwrap();
-        assert_eq!(validate(&big).err(), Some("body_too_large"));
-    }
-
-    #[test]
-    fn a_reply_draft_names_its_parent() {
-        let (_, new) = validate(&request(json!({})).unwrap()).unwrap();
-        assert_eq!(new.parent, None);
-        let reply = request(json!({"in_reply_to": "<p@x>", "references": "<r@x> <p@x>",
-            "action": "reply_all"}))
-        .unwrap();
-        let (_, thread) = validate(&reply).unwrap();
-        assert_eq!(thread.parent.as_deref(), Some("p@x"));
-        assert_ne!(thread.conversation_type, new.conversation_type);
-        let bad = request(json!({"in_reply_to": "a b@x"})).unwrap();
-        assert_eq!(validate(&bad).err(), Some("invalid_thread"));
-        assert!(request(json!({"action": "redirect"})).is_err());
-    }
-
-    #[test]
-    fn unknown_and_missing_fields_are_refused() {
-        assert!(request(json!({"delivery": "ordinary"})).is_err());
-        let mut missing = json!({
-            "session": {"login": "", "user_id": "", "access_token": "", "encrypted_passphrase_key": []},
-            "sender": "me@example.org",
-        });
-        assert!(serde_json::from_value::<SaveDraft>(missing.take()).is_err());
+    fn the_body_is_capped() {
+        let mut big = request();
+        big.body_html = "x".repeat(MAX_BODY_BYTES + 1);
+        assert_eq!(big.check(), Err(Error::BodyTooLarge));
+        big.body_html.pop();
+        assert_eq!(big.check(), Ok(()));
     }
 }

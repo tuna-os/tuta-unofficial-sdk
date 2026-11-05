@@ -5,7 +5,7 @@
 //!
 //! No public-key or passphrase cryptography happens here. Recipient keys are
 //! loaded and the bucket key is encrypted for them inside the SDK, through the
-//! audited `AsymmetricCryptoFacade` path that Hylki's SDK patch exposes
+//! audited `AsymmetricCryptoFacade` path that this repository's SDK patch exposes
 //! (`sdk-patches/01-recipient-key-data.patch`), and a password-protected
 //! recipient's key data is built there too
 //! (`sdk-patches/04-secure-external-recipient.patch`); this module only wraps
@@ -13,18 +13,18 @@
 //! already did.
 //!
 //! Key verification: the official client only refuses a key that differs from
-//! one the user verified by hand. Hylki has no verified contacts, so the
+//! one the user verified by hand. This crate keeps no verified contacts, so the
 //! current key from the PublicKeyService is used, as the official client does
 //! for every unverified contact. Each recipient's key version and fingerprint
 //! is reported back, so a caller can pin keys (trust on first use) later.
 
-use crate::secure_external::Passwords;
-use crate::{aggregate_id, diag, RecipientKind, Result, SEND_LANGUAGE};
+use crate::contacts::Passwords;
+use crate::send::{aggregate_id, RecipientKind, SEND_LANGUAGE};
+use crate::{diag, Error, Result};
 use crypto_primitives::{
     aes::InitializationVector, key::GenericAesKey, randomizer_facade::RandomizerFacade,
 };
-use serde_json::{json, Value};
-use std::sync::Mutex;
+use serde::Serialize;
 use tutasdk::{
     crypto::asymmetric_crypto_facade::{
         AsymmetricCryptoError, InternalRecipientKey, InternalRecipientKeyError,
@@ -98,7 +98,7 @@ pub(crate) fn plan(
             .iter()
             .any(|address| passwords.get(address).is_none())
         {
-            return Err("password_required");
+            return Err(Error::PasswordRequired);
         }
         if let Some(code) = unknown {
             return Err(code);
@@ -106,7 +106,7 @@ pub(crate) fn plan(
         return Ok(Plan::Confidential { internal, external });
     }
     if !ordinary_confirmed {
-        return Err("ordinary_delivery_requires_consent");
+        return Err(Error::OrdinaryDeliveryRequiresConsent);
     }
     Ok(Plan::Ordinary(
         unknown
@@ -145,11 +145,11 @@ pub(crate) async fn recipient_keys(
             // Its Debug form lists addresses: count them instead.
             InternalRecipientKeyError::RecipientsNotFound(missing) => {
                 diag::note(&format!("recipient keys: {} not found", missing.len()));
-                "recipient_not_found"
+                Error::RecipientNotFound
             }
             InternalRecipientKeyError::ExternalSender => {
                 diag::note("recipient keys: external sender");
-                "send_failed"
+                Error::SendFailed
             }
             InternalRecipientKeyError::Crypto(error) => {
                 diag::failed("recipient keys", &error);
@@ -157,8 +157,8 @@ pub(crate) async fn recipient_keys(
                     AsymmetricCryptoError::ApiCall(ApiCallError::RestClient { .. })
                     | AsymmetricCryptoError::PublicKeyLoadingError(
                         PublicKeyLoadingError::KeyLoadingError(ApiCallError::RestClient { .. }),
-                    ) => "transport_failed",
-                    _ => "send_failed",
+                    ) => Error::TransportFailed,
+                    _ => Error::SendFailed,
                 }
             }
         })
@@ -194,40 +194,53 @@ pub(crate) async fn secure_external_keys(
                     "secure external keys: {} without a password",
                     missing.len()
                 ));
-                "password_required"
+                Error::PasswordRequired
             }
             SecureExternalRecipientError::ExternalSender
             | SecureExternalRecipientError::SharedMailboxSender => {
                 diag::failed("secure external keys", &error);
-                "secure_external_sender_unsupported"
+                Error::SecureExternalSenderUnsupported
             }
             error => {
                 diag::failed("secure external keys", &error);
                 match error {
                     SecureExternalRecipientError::ApiCall(ApiCallError::RestClient { .. }) => {
-                        "transport_failed"
+                        Error::TransportFailed
                     }
-                    _ => "send_failed",
+                    _ => Error::SendFailed,
                 }
             }
         })
 }
 
-/// What a recipient's key looked like, for the send reply: never key bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecipientReport {
-    address: String,
-    key_version: i64,
-    protocol: &'static str,
-    fingerprint: String,
+/// The key-exchange protocol a Tuta recipient's key uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyProtocol {
+    /// TutaCrypt: X25519 plus Kyber.
+    TutaCrypt,
+    Rsa,
+}
+
+/// What a Tuta recipient's key looked like, for the send outcome: never key
+/// bytes. `fingerprint` is the hex SHA-256 over the public key the bucket
+/// key was encrypted with (each RSA, X25519 and Kyber component as the
+/// public-key service serves it, length-prefixed as a big-endian u32): the
+/// hook for pinning keys later (trust on first use).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RecipientReport {
+    pub address: String,
+    pub key_version: i64,
+    pub protocol: KeyProtocol,
+    pub fingerprint: String,
 }
 
 impl RecipientReport {
     pub(crate) fn of(key: &InternalRecipientKey) -> Self {
         let protocol = if key.key_data.protocolVersion == CryptoProtocolVersion::TutaCrypt as i64 {
-            "tuta_crypt"
+            KeyProtocol::TutaCrypt
         } else {
-            "rsa"
+            KeyProtocol::Rsa
         };
         Self {
             address: key.key_data.mailAddress.clone(),
@@ -240,45 +253,15 @@ impl RecipientReport {
                 .collect(),
         }
     }
-
-    fn to_json(&self) -> Value {
-        json!({"address": self.address, "key_version": self.key_version,
-            "protocol": self.protocol, "fingerprint": self.fingerprint})
-    }
 }
 
-/// The mode a submitted send went out in, as the reply reports it.
+/// The mode a submitted send went out in, as the outcome reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivered {
     pub(crate) confidential: bool,
     pub(crate) recipients: Vec<RecipientReport>,
     /// The recipients outside Tuta that got it password-protected.
     pub(crate) secure_external: Vec<String>,
-}
-
-impl Delivered {
-    pub(crate) fn to_json(&self) -> Value {
-        json!({"confidential": self.confidential,
-            "recipients": self.recipients.iter().map(RecipientReport::to_json).collect::<Vec<_>>(),
-            "secure_external": self.secure_external})
-    }
-}
-
-// Recorded just before the submit, so a run that overruns its timeout after
-// the submit still reports the mode the mail went out in.
-static DELIVERED: Mutex<Option<Delivered>> = Mutex::new(None);
-
-pub(crate) fn record(delivered: &Delivered) {
-    *DELIVERED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(delivered.clone());
-}
-
-pub(crate) fn recorded() -> Option<Delivered> {
-    DELIVERED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
 }
 
 /// The key material a send hands the server, per mode.
@@ -356,7 +339,7 @@ pub(crate) fn confidential_keys(
                     status.as_bytes(),
                     InitializationVector::generate(randomizer),
                 )
-                .map_err(diag::fail("auth status", "send_failed"))?,
+                .map_err(diag::fail("auth status", Error::SendFailed))?,
         )
     } else {
         None
@@ -426,9 +409,9 @@ pub(crate) fn send_payload(
         // Only a secure-external recipient's notification mail reads it.
         senderNameUnencrypted: keys.sender_name_unencrypted.clone(),
         // Plaintext stays off in both copies: the official client reads the
-        // account's sendPlaintextOnly property, but Hylki has no such
-        // setting and always composes HTML, so the flag matches the content
-        // rather than a server-side switch the user cannot see here.
+        // account's sendPlaintextOnly property, but a `SendRequest` is
+        // always HTML, so the flag matches the content rather than a
+        // server-side switch.
         plaintext: false,
         calendarMethod: false,
         sessionEncEncryptionAuthStatus: keys.session_enc_encryption_auth_status.clone(),
@@ -570,7 +553,7 @@ mod tests {
                     &people(&[Internal, External, External]),
                     &passwords(given)
                 ),
-                Err("password_required"),
+                Err(Error::PasswordRequired),
                 "{given}"
             );
         }
@@ -590,14 +573,14 @@ mod tests {
         );
         assert_eq!(
             plan(false, false, &people(&[Internal, External]), &given),
-            Err("ordinary_delivery_requires_consent")
+            Err(Error::OrdinaryDeliveryRequiresConsent)
         );
         // A failed lookup leaves the counts unknown, not the send.
         assert_eq!(
             plan(
                 false,
                 true,
-                &people(&[External, Unknown("transport_failed")]),
+                &people(&[External, Unknown(Error::TransportFailed)]),
                 &Passwords::default()
             ),
             Ok(Plan::Ordinary(None))
@@ -610,19 +593,19 @@ mod tests {
             plan(
                 false,
                 true,
-                &people(&[Internal, Unknown("transport_failed")]),
+                &people(&[Internal, Unknown(Error::TransportFailed)]),
                 &Passwords::default()
             ),
-            Err("transport_failed")
+            Err(Error::TransportFailed)
         );
         assert_eq!(
             plan(
                 true,
                 false,
-                &people(&[Unknown("send_failed")]),
+                &people(&[Unknown(Error::SendFailed)]),
                 &Passwords::default()
             ),
-            Err("send_failed")
+            Err(Error::SendFailed)
         );
         // Confidential with someone outside Tuta: an unknown recipient might
         // need a password or a key, so the send cannot go.
@@ -630,10 +613,10 @@ mod tests {
             plan(
                 true,
                 true,
-                &people(&[External, Unknown("transport_failed")]),
+                &people(&[External, Unknown(Error::TransportFailed)]),
                 &passwords(r#"{"r0@example.org":"pw"}"#)
             ),
-            Err("transport_failed")
+            Err(Error::TransportFailed)
         );
     }
 
@@ -927,24 +910,20 @@ mod tests {
             key_data: recipient("ada@tuta.com", CryptoProtocolVersion::TutaCrypt),
             public_key_fingerprint: vec![0xab; 32],
         };
-        let delivered = Delivered {
-            confidential: true,
-            recipients: vec![RecipientReport::of(&key)],
-            secure_external: vec!["ext@example.org".to_string()],
-        };
-        let reply = delivered.to_json();
-        assert_eq!(reply["confidential"], json!(true));
-        assert_eq!(reply["secure_external"], json!(["ext@example.org"]));
-        let row = &reply["recipients"][0];
-        assert_eq!(row["address"], json!("ada@tuta.com"));
-        assert_eq!(row["key_version"], json!(2));
-        assert_eq!(row["protocol"], json!("tuta_crypt"));
-        assert_eq!(row["fingerprint"], json!("ab".repeat(32)));
+        let row = serde_json::to_value(RecipientReport::of(&key)).unwrap();
+        assert_eq!(row["address"], serde_json::json!("ada@tuta.com"));
+        assert_eq!(row["key_version"], serde_json::json!(2));
+        assert_eq!(row["protocol"], serde_json::json!("tuta_crypt"));
+        assert_eq!(row["fingerprint"], serde_json::json!("ab".repeat(32)));
         assert_eq!(row.as_object().unwrap().len(), 4);
         let rsa = InternalRecipientKey {
             key_data: recipient("old@tutanota.de", CryptoProtocolVersion::Rsa),
             public_key_fingerprint: vec![1; 32],
         };
-        assert_eq!(RecipientReport::of(&rsa).protocol, "rsa");
+        assert_eq!(RecipientReport::of(&rsa).protocol, KeyProtocol::Rsa);
+        assert_eq!(
+            serde_json::to_value(KeyProtocol::Rsa).unwrap(),
+            serde_json::json!("rsa")
+        );
     }
 }

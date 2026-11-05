@@ -1,0 +1,40 @@
+[package]
+name = "tuta-unofficial-sdk"
+description = "Unofficial, community-maintained Tuta (Tutanota) SDK for Rust: E2EE mail, contacts, drafts, push"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["tuta", "tutanota", "email", "e2ee"]
+categories = ["email", "api-bindings"]
+# Depends on path crates written by prepare.sh, so it is not publishable
+# to crates.io; consume it as a git dependency or a submodule.
+publish = false
+
+[dependencies]
+# All three come from prepared/, which prepare.sh writes: TutaBridge's pinned
+# SDK with this repository's sdk-patches/ applied, and TutaBridge's crate
+# beside it.
+tuta-sdk = { path = "../../prepared/sdk/generated/tuta-sdk/rust/sdk", features = ["net"] }
+tutabridge-tuta = { path = "../../prepared/crates/tuta" }
+# The SDK's own public crypto (session keys, attachment encryption), from the
+# same prepared tree as tuta-sdk: MailFacade exposes no send API at this pin.
+crypto-primitives = { path = "../../prepared/sdk/generated/tuta-sdk/rust/crypto-primitives" }
+rand_core = "0.6"
+async-trait = "0.1"
+base64 = "0.22"
+futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
+# MIME parsing for `import`, the version and features the official desktop
+# importer (tutanota `src/app-kit/mimimi`) uses, so its conversion ports as is.
+mail-parser = { version = "0.10.2", features = ["full_encoding"] }
+# Session tokens, wrapped keys and recipient passwords.
+secrecy = "0.10"
+zeroize = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

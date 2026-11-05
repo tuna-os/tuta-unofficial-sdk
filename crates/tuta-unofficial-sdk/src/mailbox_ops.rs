@@ -7,14 +7,20 @@
 //! Their names are encrypted with a fresh session key that is itself wrapped
 //! with the mail group key, exactly as the official client creates them; the
 //! SDK's service executor does the encryption (`ExtraServiceParams.session_key`).
-use super::{diag, id, resume, tuple, Result, Session, MAIL_BATCH_LIMIT, TRASH_FOLDER_TYPE};
+use crate::{
+    diag,
+    error::api_code,
+    ids::{id, Id},
+    mail::{IdOutcome, Label, Outcome},
+    send::TRASH_FOLDER_TYPE,
+    Error, Result, Session, MAIL_BATCH_LIMIT,
+};
 use crypto_primitives::{
     aes::{Aes256Key, InitializationVector},
     key::GenericAesKey,
     randomizer_facade::RandomizerFacade,
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use tutasdk::{
     entities::generated::tutanota::{
@@ -29,7 +35,7 @@ use tutasdk::{
         },
         ExtraServiceParams,
     },
-    ApiCallError, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk, Sdk,
+    ApiCallError, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk,
 };
 
 // TS `MailSetKind`.
@@ -38,52 +44,20 @@ pub(crate) const SPAM_FOLDER_TYPE: i64 = 5;
 pub(crate) const LABEL_FOLDER_TYPE: i64 = 8;
 pub(crate) const IMPORTED_FOLDER_TYPE: i64 = 9;
 /// TS `MAX_LABELS_PER_MAIL`: the official client never applies more.
-const MAX_LABELS_PER_MAIL: usize = 5;
+pub const MAX_LABELS_PER_MAIL: usize = 5;
 /// Longest folder or label name accepted, in characters. The official client
 /// sets no explicit limit; this only keeps a pathological request off the
 /// wire.
-const MAX_NAME_CHARS: usize = 256;
+pub const MAX_NAME_CHARS: usize = 256;
 /// A folder tree deeper than this is malformed; parent walks stop here.
 const MAX_FOLDER_DEPTH: usize = 64;
-
-/// The fixed code for a failed SDK call. Session, version and transport
-/// classes keep their shared codes; a missing instance reports `not_found`;
-/// everything else reports the operation's own `fallback`.
-pub(crate) fn api_code(
-    error: ApiCallError,
-    fallback: &'static str,
-    not_found: &'static str,
-) -> &'static str {
-    match error {
-        ApiCallError::RestClient { .. } => "transport_failed",
-        ApiCallError::ServerResponseError { source } => match source {
-            HttpError::InvalidSoftwareVersionError => "client_outdated",
-            HttpError::SessionExpiredError
-            | HttpError::NotAuthenticatedError
-            | HttpError::AccessExpiredError
-            | HttpError::AccessDeactivatedError
-            | HttpError::AccessBlockedError => "session_revoked",
-            HttpError::NotFoundError => not_found,
-            HttpError::RequestTimeoutError => "timeout",
-            HttpError::LimitReachedError => "limit_reached",
-            HttpError::ConnectionError
-            | HttpError::InternalServerError
-            | HttpError::BadGatewayError
-            | HttpError::ServiceUnavailableError { .. }
-            | HttpError::TooManyRequestsError { .. }
-            | HttpError::LockedError => "transport_failed",
-            _ => fallback,
-        },
-        ApiCallError::InternalSdkError { .. } => fallback,
-    }
-}
 
 /// `api_code` plus a diagnostic line naming the stage.
 fn fail(
     stage: &'static str,
-    fallback: &'static str,
-    not_found: &'static str,
-) -> impl FnOnce(ApiCallError) -> &'static str {
+    fallback: Error,
+    not_found: Error,
+) -> impl FnOnce(ApiCallError) -> Error {
     move |error| {
         diag::failed(stage, &error);
         api_code(error, fallback, not_found)
@@ -101,18 +75,22 @@ pub(crate) async fn load_mailbox(sdk: &LoggedInSdk) -> Result<Mailbox> {
     let facade = sdk.mail_facade();
     let mailbox = facade.load_user_mailbox().await.map_err(fail(
         "mailbox load",
-        "request_failed",
-        "request_failed",
+        Error::RequestFailed,
+        Error::RequestFailed,
     ))?;
     let sets: Vec<MailSet> = facade
         .get_crypto_entity_client()
         .load_all(&mailbox.mailSets.mailSets, ListLoadDirection::ASC)
         .await
-        .map_err(fail("mail set load", "request_failed", "request_failed"))?;
+        .map_err(fail(
+            "mail set load",
+            Error::RequestFailed,
+            Error::RequestFailed,
+        ))?;
     if sets.iter().any(|set| !set._errors.is_empty()) {
-        return Err("decryption_failed");
+        return Err(Error::DecryptionFailed);
     }
-    let group = mailbox._ownerGroup.ok_or("incomplete_response")?;
+    let group = mailbox._ownerGroup.ok_or(Error::IncompleteResponse)?;
     Ok(Mailbox { group, sets })
 }
 
@@ -166,25 +144,46 @@ fn descendants_deepest_first<'a>(
     levels.into_iter().map(|(_, set)| set).collect()
 }
 
-/// A folder or label name: trimmed, non-empty, no control characters.
-fn valid_name(name: &str) -> Result<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty()
-        || trimmed.chars().count() > MAX_NAME_CHARS
-        || trimmed.chars().any(char::is_control)
-    {
-        return Err("invalid_name");
+/// A folder or label name: trimmed, non-empty, at most [`MAX_NAME_CHARS`]
+/// characters, no control characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Name(String);
+
+impl Name {
+    /// The trimmed name; anything else is [`Error::InvalidName`].
+    pub fn new(name: &str) -> Result<Self> {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed.chars().count() > MAX_NAME_CHARS
+            || trimmed.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidName);
+        }
+        Ok(Name(trimmed.to_string()))
     }
-    Ok(trimmed.to_string())
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// A label colour as the official client stores it: `#rrggbb`.
-fn valid_color(color: &str) -> Result<String> {
-    let hex = color.strip_prefix('#').ok_or("invalid_color")?;
-    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid_color");
+/// A label colour as the official client stores it: `#rrggbb`, lower case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Color(String);
+
+impl Color {
+    /// `#rrggbb` in any case; anything else is [`Error::InvalidColor`].
+    pub fn new(color: &str) -> Result<Self> {
+        let hex = color.strip_prefix('#').ok_or(Error::InvalidColor)?;
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::InvalidColor);
+        }
+        Ok(Color(color.to_ascii_lowercase()))
     }
-    Ok(color.to_ascii_lowercase())
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Whether a sibling of `parent` already carries `name`. The official
@@ -208,7 +207,7 @@ fn name_taken(
 async fn new_owned_session_key(
     sdk: &LoggedInSdk,
     group: &GeneratedId,
-    fallback: &'static str,
+    fallback: Error,
 ) -> Result<(GenericAesKey, Vec<u8>, i64)> {
     let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
     let group_key = sdk.get_current_sym_group_key(group).await.map_err(fail(
@@ -238,202 +237,113 @@ pub(crate) fn is_label(set: &MailSet) -> bool {
     set.folderType == LABEL_FOLDER_TYPE
 }
 
-pub(crate) fn label_row(set: &MailSet) -> Option<Value> {
-    let label_id = id(set._id.as_ref()?);
-    Some(json!({"id": label_id, "name": set.name, "color": set.color.clone().unwrap_or_default()}))
+pub(crate) fn label_row(set: &MailSet) -> Option<Label> {
+    Some(Label {
+        id: Id::from_tuple(set._id.clone()?),
+        name: set.name.clone(),
+        color: set.color.clone().unwrap_or_default(),
+    })
 }
 
 /// The labels a mail carries: its `sets` that are labels.
-pub(crate) fn mail_labels(sets: &[IdTupleGenerated], label_ids: &HashSet<String>) -> Vec<String> {
+pub(crate) fn mail_labels(sets: &[IdTupleGenerated], label_ids: &HashSet<String>) -> Vec<Id> {
     sets.iter()
-        .map(id)
-        .filter(|set| label_ids.contains(set))
+        .filter(|set| label_ids.contains(&id(set)))
+        .map(|set| Id::from_tuple(set.clone()))
         .collect()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ListLabels {
-    session: Session,
-}
-
-pub(crate) async fn list_labels(sdk: &Sdk, request: ListLabels) -> Result<Value> {
-    let logged_in = resume(sdk, request.session).await?;
-    let mailbox = load_mailbox(&logged_in).await?;
-    let labels: Vec<Value> = mailbox
-        .sets
-        .iter()
-        .filter(|set| is_label(set))
-        .filter_map(label_row)
-        .collect();
-    Ok(json!({"labels": labels}))
 }
 
 // ----------------------------------------------------------------- folders
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CreateFolder {
-    pub session: Session,
-    name: String,
-    parent: Option<String>,
+/// A rename and/or re-parent of a custom folder, checked before any I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderEdit {
+    folder: Id,
+    name: Option<Name>,
+    /// None keeps the parent; `Some(None)` moves it to the top level.
+    parent: Option<Option<Id>>,
 }
 
-pub(crate) async fn create_folder(sdk: &Sdk, request: CreateFolder) -> Result<Value> {
-    let name = valid_name(&request.name)?;
-    let parent = request.parent.as_deref().map(tuple).transpose()?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    if let Some(parent) = &parent {
-        // Folders nest under folders, never under labels.
-        match find(&mailbox.sets, parent) {
-            Some(set) if !is_label(set) => {}
-            _ => return Err("folder_not_found"),
+impl FolderEdit {
+    /// At least one change ([`Error::InvalidRequest`] otherwise), and never
+    /// the folder as its own parent ([`Error::InvalidParent`]).
+    pub fn new(folder: Id, name: Option<Name>, parent: Option<Option<Id>>) -> Result<Self> {
+        if name.is_none() && parent.is_none() {
+            return Err(Error::InvalidRequest);
         }
-    }
-    if name_taken(&mailbox.sets, parent.as_ref(), &name, None) {
-        return Err("folder_exists");
-    }
-    let (session_key, owner_enc, version) =
-        new_owned_session_key(sdk, &mailbox.group, "folder_failed").await?;
-    let created = sdk
-        .get_service_executor()
-        .post::<MailFolderService>(
-            CreateMailFolderData {
-                _format: 0,
-                folderName: name,
-                ownerEncSessionKey: owner_enc,
-                ownerGroup: Some(mailbox.group),
-                ownerKeyVersion: version,
-                parentFolder: parent,
-                _errors: Default::default(),
-            },
-            ExtraServiceParams {
-                session_key: Some(session_key),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(fail("folder create", "folder_failed", "folder_not_found"))?;
-    Ok(json!({"id": id(&created.newFolder)}))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RenameFolder {
-    pub session: Session,
-    id: String,
-    name: Option<String>,
-    /// Absent keeps the parent, `""` moves the folder to the top level.
-    parent: Option<String>,
-}
-
-/// What a rename/re-parent request asks for, validated before any I/O.
-struct FolderEdit {
-    folder: IdTupleGenerated,
-    name: Option<String>,
-    parent: Option<Option<IdTupleGenerated>>,
-}
-
-fn folder_edit(request: &RenameFolder) -> Result<FolderEdit> {
-    let folder = tuple(&request.id)?;
-    let name = request.name.as_deref().map(valid_name).transpose()?;
-    let parent = match request.parent.as_deref() {
-        None => None,
-        Some("") => Some(None),
-        Some(parent) => Some(Some(tuple(parent)?)),
-    };
-    if name.is_none() && parent.is_none() {
-        return Err("invalid_request");
-    }
-    if parent.as_ref().is_some_and(|p| p.as_ref() == Some(&folder)) {
-        return Err("invalid_parent");
-    }
-    Ok(FolderEdit {
-        folder,
-        name,
-        parent,
-    })
-}
-
-/// Rename and/or re-parent a custom folder: the name through an update of
-/// the `MailSet` itself (TS `updateMailFolderName`, `entityClient.update`),
-/// the parent through `MailFolderService` PUT (TS `updateMailFolderParent`).
-pub(crate) async fn rename_folder(sdk: &Sdk, request: RenameFolder) -> Result<Value> {
-    let edit = folder_edit(&request)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    let folder = find(&mailbox.sets, &edit.folder).ok_or("folder_not_found")?;
-    if folder.folderType != CUSTOM_FOLDER_TYPE {
-        return Err("not_custom_folder");
-    }
-    let new_parent = match &edit.parent {
-        Some(Some(parent)) => {
-            match find(&mailbox.sets, parent) {
-                Some(set) if !is_label(set) => {}
-                _ => return Err("folder_not_found"),
-            }
-            // A folder cannot move under its own subtree.
-            if descendants_deepest_first(&mailbox.sets, &edit.folder)
-                .iter()
-                .any(|d| same(d, parent))
-            {
-                return Err("invalid_parent");
-            }
-            Some(Some(parent.clone()))
+        if parent.as_ref().is_some_and(|p| p.as_ref() == Some(&folder)) {
+            return Err(Error::InvalidParent);
         }
-        Some(None) => Some(None),
-        None => None,
-    };
-    let target_parent = match &new_parent {
-        Some(parent) => parent.clone(),
-        None => folder.parentFolder.clone(),
-    };
-    let target_name = edit.name.clone().unwrap_or_else(|| folder.name.clone());
-    if name_taken(
-        &mailbox.sets,
-        target_parent.as_ref(),
-        &target_name,
-        Some(&edit.folder),
-    ) {
-        return Err("folder_exists");
+        Ok(FolderEdit {
+            folder,
+            name,
+            parent,
+        })
     }
-    if let Some(name) = edit.name.filter(|name| *name != folder.name) {
-        let mut renamed = folder.clone();
-        renamed.name = name;
-        sdk.mail_facade()
-            .get_crypto_entity_client()
-            .update_instance(renamed)
-            .await
-            .map_err(fail("folder rename", "folder_failed", "folder_not_found"))?;
-    }
-    if let Some(parent) = new_parent.filter(|p| *p != folder.parentFolder) {
-        sdk.get_service_executor()
-            .put::<MailFolderService>(
-                UpdateMailFolderData {
-                    _format: 0,
-                    folder: edit.folder.clone(),
-                    newParent: parent,
-                },
-                ExtraServiceParams::default(),
-            )
-            .await
-            .map_err(fail(
-                "folder re-parent",
-                "folder_failed",
-                "folder_not_found",
-            ))?;
-    }
-    Ok(json!({}))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DeleteFolder {
-    pub session: Session,
-    id: String,
+/// What `delete_folder` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderDeletion {
+    /// Deleted for good, with its mail (inside Trash or Spam), or because it
+    /// and every folder in it were empty.
+    Deleted,
+    /// Moved under Trash with its mail.
+    Trashed,
+}
+
+/// What to change on a label, checked before any I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelEdit {
+    name: Option<Name>,
+    color: Option<Color>,
+}
+
+impl LabelEdit {
+    /// At least one of the two ([`Error::InvalidRequest`] otherwise).
+    pub fn new(name: Option<Name>, color: Option<Color>) -> Result<Self> {
+        if name.is_none() && color.is_none() {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(LabelEdit { name, color })
+    }
+}
+
+/// Labels to add to and remove from mail, checked before any I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelChanges {
+    add: Vec<IdTupleGenerated>,
+    remove: Vec<IdTupleGenerated>,
+}
+
+impl LabelChanges {
+    /// Something to do, no label both added and removed, and at most
+    /// [`MAX_LABELS_PER_MAIL`] added; [`Error::InvalidRequest`] otherwise.
+    pub fn new(add: Vec<Id>, remove: Vec<Id>) -> Result<Self> {
+        let add: Vec<IdTupleGenerated> = add.into_iter().map(Id::into_tuple).collect();
+        let remove: Vec<IdTupleGenerated> = remove.into_iter().map(Id::into_tuple).collect();
+        if (add.is_empty() && remove.is_empty())
+            || add.len() > MAX_LABELS_PER_MAIL
+            || add.iter().any(|label| remove.contains(label))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(LabelChanges { add, remove })
+    }
+}
+
+/// One moved id's outcome: `new_id` and `source` come from the server's own
+/// report of what it moved. A Tuta mail keeps its id when it moves, so
+/// `new_id` equals `id`, and `source` is the folder it left -- what the
+/// official client moves back to undo. Both are None for a mail the server
+/// did not move (it was already in the destination).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MoveOutcome {
+    pub id: Id,
+    pub code: Outcome,
+    pub new_id: Option<Id>,
+    pub source: Option<Id>,
 }
 
 /// Whether a folder holds no mail. TS `isEmptyFolder`: one entry is enough.
@@ -451,7 +361,11 @@ async fn is_empty_folder(sdk: &LoggedInSdk, folder: &MailSet) -> Result<bool> {
             ListLoadDirection::ASC,
         )
         .await
-        .map_err(fail("folder entries", "request_failed", "folder_not_found"))?;
+        .map_err(fail(
+            "folder entries",
+            Error::RequestFailed,
+            Error::FolderNotFound,
+        ))?;
     Ok(entries.is_empty())
 }
 
@@ -480,148 +394,23 @@ async fn finally_delete_folder(sdk: &LoggedInSdk, folder: &IdTupleGenerated) -> 
         }) => Ok(()),
         Err(ApiCallError::ServerResponseError {
             source: HttpError::PreconditionFailedError(_),
-        }) => Err("operation_still_active"),
-        Err(error) => Err(fail("folder delete", "folder_failed", "folder_not_found")(
-            error,
-        )),
+        }) => Err(Error::OperationStillActive),
+        Err(error) => Err(fail(
+            "folder delete",
+            Error::FolderFailed,
+            Error::FolderNotFound,
+        )(error)),
     }
-}
-
-/// Delete a custom folder the way the official client's sidebar does
-/// (`MailView.deleteCustomMailFolder`): inside Trash or Spam it is deleted
-/// for good; elsewhere empty descendants -- and the folder itself, when it
-/// and all of them are empty -- are deleted, and a folder that still holds
-/// mail is moved under Trash instead (`MailModel.trashFolderAndSubfolders`).
-pub(crate) async fn delete_folder(sdk: &Sdk, request: DeleteFolder) -> Result<Value> {
-    let target = tuple(&request.id)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    let folder = find(&mailbox.sets, &target).ok_or("folder_not_found")?;
-    if folder.folderType != CUSTOM_FOLDER_TYPE && folder.folderType != IMPORTED_FOLDER_TYPE {
-        return Err("not_custom_folder");
-    }
-    if in_trash_or_spam(&mailbox.sets, &target) {
-        finally_delete_folder(sdk, &target).await?;
-        return Ok(json!({"outcome": "deleted"}));
-    }
-    // TS `removeAllEmpty`.
-    let mut deleted: HashSet<String> = HashSet::new();
-    let mut some_non_empty = false;
-    let children_deleted = |parent: &IdTupleGenerated, deleted: &HashSet<String>| {
-        mailbox
-            .sets
-            .iter()
-            .filter(|set| set.folderType == CUSTOM_FOLDER_TYPE)
-            .filter(|set| set.parentFolder.as_ref() == Some(parent))
-            .all(|set| set._id.as_ref().is_some_and(|i| deleted.contains(&id(i))))
-    };
-    for descendant in descendants_deepest_first(&mailbox.sets, &target) {
-        let Some(descendant_id) = descendant._id.as_ref() else {
-            continue;
-        };
-        if is_empty_folder(sdk, descendant).await? && children_deleted(descendant_id, &deleted) {
-            finally_delete_folder(sdk, descendant_id).await?;
-            deleted.insert(id(descendant_id));
-        } else {
-            some_non_empty = true;
-        }
-    }
-    if !some_non_empty && is_empty_folder(sdk, folder).await? && children_deleted(&target, &deleted)
-    {
-        finally_delete_folder(sdk, &target).await?;
-        return Ok(json!({"outcome": "deleted"}));
-    }
-    let trash = mailbox
-        .sets
-        .iter()
-        .find(|set| set.folderType == TRASH_FOLDER_TYPE)
-        .and_then(|set| set._id.clone())
-        .ok_or("folder_not_found")?;
-    sdk.get_service_executor()
-        .put::<MailFolderService>(
-            UpdateMailFolderData {
-                _format: 0,
-                folder: target,
-                newParent: Some(trash),
-            },
-            ExtraServiceParams::default(),
-        )
-        .await
-        .map_err(fail("folder to trash", "folder_failed", "folder_not_found"))?;
-    Ok(json!({"outcome": "trashed"}))
-}
-
-// ------------------------------------------------------------------ labels
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CreateLabel {
-    pub session: Session,
-    name: String,
-    color: String,
-}
-
-/// TS `MailFacade.createLabel`: `ManageLabelService` POST.
-pub(crate) async fn create_label(sdk: &Sdk, request: CreateLabel) -> Result<Value> {
-    let name = valid_name(&request.name)?;
-    let color = valid_color(&request.color)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    if mailbox
-        .sets
-        .iter()
-        .any(|set| is_label(set) && set.name.trim().eq_ignore_ascii_case(&name))
-    {
-        return Err("label_exists");
-    }
-    let (session_key, owner_enc, version) =
-        new_owned_session_key(sdk, &mailbox.group, "label_failed").await?;
-    let created = sdk
-        .get_service_executor()
-        .post::<ManageLabelService>(
-            ManageLabelServicePostIn {
-                _format: 0,
-                ownerEncSessionKey: owner_enc,
-                ownerKeyVersion: version,
-                ownerGroup: mailbox.group,
-                data: ManageLabelServiceLabelData {
-                    _id: None,
-                    name,
-                    color,
-                    parentLabel: None,
-                    _errors: Default::default(),
-                },
-                _errors: Default::default(),
-            },
-            ExtraServiceParams {
-                session_key: Some(session_key),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(fail("label create", "label_failed", "label_failed"))?;
-    Ok(json!({"id": id(&created.label)}))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UpdateLabel {
-    pub session: Session,
-    id: String,
-    name: Option<String>,
-    color: Option<String>,
 }
 
 /// The session key a stored mail set was encrypted with, as TS
 /// `updateLabel` derives it: its owner group key, then `_ownerEncSessionKey`.
 async fn mail_set_session_key(sdk: &LoggedInSdk, set: &MailSet) -> Result<GenericAesKey> {
-    let group = set._ownerGroup.as_ref().ok_or("incomplete_response")?;
+    let group = set._ownerGroup.as_ref().ok_or(Error::IncompleteResponse)?;
     let encrypted = set
         ._ownerEncSessionKey
         .as_ref()
-        .ok_or("incomplete_response")?;
+        .ok_or(Error::IncompleteResponse)?;
     let version = set._ownerKeyVersion.unwrap_or(0).unsigned_abs();
     let group_key = sdk
         .mail_facade()
@@ -632,96 +421,12 @@ async fn mail_set_session_key(sdk: &LoggedInSdk, set: &MailSet) -> Result<Generi
         .await
         .map_err(|error| {
             diag::failed("label key", &error);
-            "label_failed"
+            Error::LabelFailed
         })?;
     group_key.decrypt_aes_key(encrypted).map_err(|error| {
         diag::failed("label key", &error);
-        "decryption_failed"
+        Error::DecryptionFailed
     })
-}
-
-/// TS `MailFacade.updateLabel`: `ManageLabelService` PUT.
-pub(crate) async fn update_label(sdk: &Sdk, request: UpdateLabel) -> Result<Value> {
-    let target = tuple(&request.id)?;
-    let name = request.name.as_deref().map(valid_name).transpose()?;
-    let color = request.color.as_deref().map(valid_color).transpose()?;
-    if name.is_none() && color.is_none() {
-        return Err("invalid_request");
-    }
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    let label = find(&mailbox.sets, &target)
-        .filter(|set| is_label(set))
-        .ok_or("label_not_found")?;
-    let name = name.unwrap_or_else(|| label.name.clone());
-    let color = color.unwrap_or_else(|| label.color.clone().unwrap_or_default());
-    if name == label.name && Some(&color) == label.color.as_ref() {
-        return Ok(json!({}));
-    }
-    let session_key = mail_set_session_key(sdk, label).await?;
-    sdk.get_service_executor()
-        .put::<ManageLabelService>(
-            ManageLabelServicePutIn {
-                _format: 0,
-                label: target,
-                data: ManageLabelServiceLabelData {
-                    _id: None,
-                    name,
-                    color,
-                    parentLabel: label.parentFolder.clone(),
-                    _errors: Default::default(),
-                },
-                _errors: Default::default(),
-            },
-            ExtraServiceParams {
-                session_key: Some(session_key),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(fail("label update", "label_failed", "label_not_found"))?;
-    Ok(json!({}))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DeleteLabel {
-    pub session: Session,
-    id: String,
-}
-
-/// TS `MailFacade.deleteLabel`: `ManageLabelService` DELETE. A label that is
-/// already gone counts as deleted.
-pub(crate) async fn delete_label(sdk: &Sdk, request: DeleteLabel) -> Result<Value> {
-    let target = tuple(&request.id)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    match find(&mailbox.sets, &target) {
-        None => return Ok(json!({})),
-        Some(set) if !is_label(set) => return Err("label_not_found"),
-        Some(_) => {}
-    }
-    match sdk
-        .get_service_executor()
-        .delete::<ManageLabelService>(
-            ManageLabelServiceDeleteIn {
-                _format: 0,
-                label: target,
-            },
-            ExtraServiceParams::default(),
-        )
-        .await
-    {
-        Ok(()) => Ok(json!({})),
-        Err(ApiCallError::ServerResponseError {
-            source: HttpError::NotFoundError,
-        }) => Ok(json!({})),
-        Err(error) => Err(fail("label delete", "label_failed", "label_not_found")(
-            error,
-        )),
-    }
 }
 
 // ------------------------------------------------------- per-mail batches
@@ -754,10 +459,9 @@ fn list_chunks(mails: &[IdTupleGenerated]) -> Vec<Vec<IdTupleGenerated>> {
         .collect()
 }
 
-/// Per-id outcome of a batch: `None` applied, `Some(code)` failed or never
-/// attempted. Duplicated ids share their outcome.
+/// Per-id outcome of a batch. Duplicated ids share their outcome.
 struct Batch {
-    outcomes: HashMap<String, Option<&'static str>>,
+    outcomes: HashMap<String, Outcome>,
 }
 
 impl Batch {
@@ -765,272 +469,555 @@ impl Batch {
         Self {
             outcomes: mails
                 .iter()
-                .map(|m| (id(m), Some("not_attempted")))
+                .map(|m| (id(m), Outcome::NotAttempted))
                 .collect(),
         }
     }
-    fn settle(&mut self, chunk: &[IdTupleGenerated], code: Option<&'static str>) {
+    fn settle(&mut self, chunk: &[IdTupleGenerated], outcome: Outcome) {
         for mail in chunk {
-            self.outcomes.insert(id(mail), code);
+            self.outcomes.insert(id(mail), outcome);
         }
     }
-    fn rows(&self, ids: &[String], extra: impl Fn(&str) -> Value) -> Value {
-        let rows: Vec<Value> = ids
-            .iter()
-            .map(|mail| {
-                let mut row =
-                    json!({"id": mail, "code": self.outcomes.get(mail).copied().flatten()});
-                if let (Value::Object(row), Value::Object(more)) = (&mut row, extra(mail)) {
-                    row.extend(more);
-                }
-                row
+    fn outcome(&self, mail: &Id) -> Outcome {
+        self.outcomes
+            .get(&mail.to_string())
+            .copied()
+            .unwrap_or(Outcome::NotAttempted)
+    }
+    fn rows(&self, ids: &[Id]) -> Vec<IdOutcome> {
+        ids.iter()
+            .map(|mail| IdOutcome {
+                id: mail.clone(),
+                code: self.outcome(mail),
             })
-            .collect();
-        json!({"outcomes": rows})
+            .collect()
     }
 }
 
-fn parse_batch(ids: &[String]) -> Result<Vec<IdTupleGenerated>> {
+/// A batch of 1 to `MAIL_BATCH_LIMIT` mails.
+fn check_batch(ids: &[Id]) -> Result<Vec<IdTupleGenerated>> {
     if ids.is_empty() || ids.len() > MAIL_BATCH_LIMIT {
-        return Err("invalid_batch");
+        return Err(Error::InvalidBatch);
     }
-    ids.iter().map(|s| tuple(s)).collect()
+    Ok(ids.iter().map(|mail| mail.tuple().clone()).collect())
 }
 
-/// Move mails, recording what the server reports it moved: Tuta mails keep
-/// their id across moves, and `MoveMailPostOut.movedMails` names each moved
-/// id with its source folder -- what the official client's undo moves back
-/// (`MailGuiUtils.runPostMoveActions`). An id the server does not list (it
-/// was already in the target) gets `new_id: null`.
-pub(crate) async fn move_mails(
-    sdk: &LoggedInSdk,
-    ids: &[String],
-    destination: &str,
-) -> Result<Value> {
-    let parsed = parse_batch(ids)?;
-    let destination = tuple(destination)?;
-    let mut batch = Batch::new(&parsed);
-    let mut moved: HashMap<String, String> = HashMap::new();
-    for chunk in list_chunks(&parsed) {
-        let reply = sdk
+impl Session {
+    /// Create a folder, under `parent` (a folder, never a label) or at the
+    /// top level. TS `MailFacade.createMailFolder`: `MailFolderService` POST.
+    pub async fn create_folder(&self, name: &Name, parent: Option<&Id>) -> Result<Id> {
+        let sdk = &*self.sdk;
+        let parent = parent.map(|parent| parent.tuple().clone());
+        let mailbox = load_mailbox(sdk).await?;
+        if let Some(parent) = &parent {
+            // Folders nest under folders, never under labels.
+            match find(&mailbox.sets, parent) {
+                Some(set) if !is_label(set) => {}
+                _ => return Err(Error::FolderNotFound),
+            }
+        }
+        if name_taken(&mailbox.sets, parent.as_ref(), name.as_str(), None) {
+            return Err(Error::FolderExists);
+        }
+        let (session_key, owner_enc, version) =
+            new_owned_session_key(sdk, &mailbox.group, Error::FolderFailed).await?;
+        let created = sdk
             .get_service_executor()
-            .post::<MoveMailService>(
-                MoveMailData {
+            .post::<MailFolderService>(
+                CreateMailFolderData {
                     _format: 0,
-                    moveReason: None,
-                    targetFolder: destination.clone(),
-                    mails: chunk.clone(),
-                    excludeMailSet: None,
+                    folderName: name.as_str().to_string(),
+                    ownerEncSessionKey: owner_enc,
+                    ownerGroup: Some(mailbox.group),
+                    ownerKeyVersion: version,
+                    parentFolder: parent,
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(session_key),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(fail(
+                "folder create",
+                Error::FolderFailed,
+                Error::FolderNotFound,
+            ))?;
+        Ok(Id::from_tuple(created.newFolder))
+    }
+
+    /// Rename and/or re-parent a custom folder: the name through an update
+    /// of the `MailSet` itself (TS `updateMailFolderName`,
+    /// `entityClient.update`), the parent through `MailFolderService` PUT
+    /// (TS `updateMailFolderParent`).
+    pub async fn rename_folder(&self, edit: &FolderEdit) -> Result<()> {
+        let sdk = &*self.sdk;
+        let target = edit.folder.tuple();
+        let mailbox = load_mailbox(sdk).await?;
+        let folder = find(&mailbox.sets, target).ok_or(Error::FolderNotFound)?;
+        if folder.folderType != CUSTOM_FOLDER_TYPE {
+            return Err(Error::NotCustomFolder);
+        }
+        let new_parent = match &edit.parent {
+            Some(Some(parent)) => {
+                let parent = parent.tuple();
+                match find(&mailbox.sets, parent) {
+                    Some(set) if !is_label(set) => {}
+                    _ => return Err(Error::FolderNotFound),
+                }
+                // A folder cannot move under its own subtree.
+                if descendants_deepest_first(&mailbox.sets, target)
+                    .iter()
+                    .any(|d| same(d, parent))
+                {
+                    return Err(Error::InvalidParent);
+                }
+                Some(Some(parent.clone()))
+            }
+            Some(None) => Some(None),
+            None => None,
+        };
+        let target_parent = match &new_parent {
+            Some(parent) => parent.clone(),
+            None => folder.parentFolder.clone(),
+        };
+        let target_name = edit
+            .name
+            .as_ref()
+            .map_or_else(|| folder.name.clone(), |name| name.as_str().to_string());
+        if name_taken(
+            &mailbox.sets,
+            target_parent.as_ref(),
+            &target_name,
+            Some(target),
+        ) {
+            return Err(Error::FolderExists);
+        }
+        if let Some(name) = edit
+            .name
+            .as_ref()
+            .filter(|name| name.as_str() != folder.name)
+        {
+            let mut renamed = folder.clone();
+            renamed.name = name.as_str().to_string();
+            sdk.mail_facade()
+                .get_crypto_entity_client()
+                .update_instance(renamed)
+                .await
+                .map_err(fail(
+                    "folder rename",
+                    Error::FolderFailed,
+                    Error::FolderNotFound,
+                ))?;
+        }
+        if let Some(parent) = new_parent.filter(|p| *p != folder.parentFolder) {
+            sdk.get_service_executor()
+                .put::<MailFolderService>(
+                    UpdateMailFolderData {
+                        _format: 0,
+                        folder: target.clone(),
+                        newParent: parent,
+                    },
+                    ExtraServiceParams::default(),
+                )
+                .await
+                .map_err(fail(
+                    "folder re-parent",
+                    Error::FolderFailed,
+                    Error::FolderNotFound,
+                ))?;
+        }
+        Ok(())
+    }
+
+    /// Delete a custom folder the way the official client's sidebar does
+    /// (`MailView.deleteCustomMailFolder`): inside Trash or Spam it is
+    /// deleted for good; elsewhere empty descendants -- and the folder
+    /// itself, when it and all of them are empty -- are deleted, and a folder
+    /// that still holds mail is moved under Trash instead
+    /// (`MailModel.trashFolderAndSubfolders`).
+    pub async fn delete_folder(&self, folder_id: &Id) -> Result<FolderDeletion> {
+        let sdk = &*self.sdk;
+        let target = folder_id.tuple().clone();
+        let mailbox = load_mailbox(sdk).await?;
+        let folder = find(&mailbox.sets, &target).ok_or(Error::FolderNotFound)?;
+        if folder.folderType != CUSTOM_FOLDER_TYPE && folder.folderType != IMPORTED_FOLDER_TYPE {
+            return Err(Error::NotCustomFolder);
+        }
+        if in_trash_or_spam(&mailbox.sets, &target) {
+            finally_delete_folder(sdk, &target).await?;
+            return Ok(FolderDeletion::Deleted);
+        }
+        // TS `removeAllEmpty`.
+        let mut deleted: HashSet<String> = HashSet::new();
+        let mut some_non_empty = false;
+        let children_deleted = |parent: &IdTupleGenerated, deleted: &HashSet<String>| {
+            mailbox
+                .sets
+                .iter()
+                .filter(|set| set.folderType == CUSTOM_FOLDER_TYPE)
+                .filter(|set| set.parentFolder.as_ref() == Some(parent))
+                .all(|set| set._id.as_ref().is_some_and(|i| deleted.contains(&id(i))))
+        };
+        for descendant in descendants_deepest_first(&mailbox.sets, &target) {
+            let Some(descendant_id) = descendant._id.as_ref() else {
+                continue;
+            };
+            if is_empty_folder(sdk, descendant).await? && children_deleted(descendant_id, &deleted)
+            {
+                finally_delete_folder(sdk, descendant_id).await?;
+                deleted.insert(id(descendant_id));
+            } else {
+                some_non_empty = true;
+            }
+        }
+        if !some_non_empty
+            && is_empty_folder(sdk, folder).await?
+            && children_deleted(&target, &deleted)
+        {
+            finally_delete_folder(sdk, &target).await?;
+            return Ok(FolderDeletion::Deleted);
+        }
+        let trash = mailbox
+            .sets
+            .iter()
+            .find(|set| set.folderType == TRASH_FOLDER_TYPE)
+            .and_then(|set| set._id.clone())
+            .ok_or(Error::FolderNotFound)?;
+        sdk.get_service_executor()
+            .put::<MailFolderService>(
+                UpdateMailFolderData {
+                    _format: 0,
+                    folder: target,
+                    newParent: Some(trash),
                 },
                 ExtraServiceParams::default(),
             )
-            .await;
-        match reply {
-            Ok(reply) => {
-                for group in reply.movedMails {
-                    for mail in group.mailIds {
-                        moved.insert(
-                            format!("{}/{}", mail.listId, mail.listElementId),
-                            id(&group.sourceFolder),
-                        );
-                    }
-                }
-                batch.settle(&chunk, None);
-            }
-            Err(error) => {
-                batch.settle(
-                    &chunk,
-                    Some(fail("move", "request_failed", "request_failed")(error)),
-                );
-                break;
-            }
+            .await
+            .map_err(fail(
+                "folder to trash",
+                Error::FolderFailed,
+                Error::FolderNotFound,
+            ))?;
+        Ok(FolderDeletion::Trashed)
+    }
+
+    /// Create a label. TS `MailFacade.createLabel`: `ManageLabelService` POST.
+    pub async fn create_label(&self, name: &Name, color: &Color) -> Result<Id> {
+        let sdk = &*self.sdk;
+        let mailbox = load_mailbox(sdk).await?;
+        if mailbox
+            .sets
+            .iter()
+            .any(|set| is_label(set) && set.name.trim().eq_ignore_ascii_case(name.as_str()))
+        {
+            return Err(Error::LabelExists);
+        }
+        let (session_key, owner_enc, version) =
+            new_owned_session_key(sdk, &mailbox.group, Error::LabelFailed).await?;
+        let created = sdk
+            .get_service_executor()
+            .post::<ManageLabelService>(
+                ManageLabelServicePostIn {
+                    _format: 0,
+                    ownerEncSessionKey: owner_enc,
+                    ownerKeyVersion: version,
+                    ownerGroup: mailbox.group,
+                    data: ManageLabelServiceLabelData {
+                        _id: None,
+                        name: name.as_str().to_string(),
+                        color: color.as_str().to_string(),
+                        parentLabel: None,
+                        _errors: Default::default(),
+                    },
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(session_key),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(fail("label create", Error::LabelFailed, Error::LabelFailed))?;
+        Ok(Id::from_tuple(created.label))
+    }
+
+    /// Rename and/or recolour a label. TS `MailFacade.updateLabel`:
+    /// `ManageLabelService` PUT.
+    pub async fn update_label(&self, label_id: &Id, edit: &LabelEdit) -> Result<()> {
+        let sdk = &*self.sdk;
+        let target = label_id.tuple().clone();
+        let mailbox = load_mailbox(sdk).await?;
+        let label = find(&mailbox.sets, &target)
+            .filter(|set| is_label(set))
+            .ok_or(Error::LabelNotFound)?;
+        let name = edit
+            .name
+            .as_ref()
+            .map_or_else(|| label.name.clone(), |name| name.as_str().to_string());
+        let color = edit.color.as_ref().map_or_else(
+            || label.color.clone().unwrap_or_default(),
+            |color| color.as_str().to_string(),
+        );
+        if name == label.name && Some(&color) == label.color.as_ref() {
+            return Ok(());
+        }
+        let session_key = mail_set_session_key(sdk, label).await?;
+        sdk.get_service_executor()
+            .put::<ManageLabelService>(
+                ManageLabelServicePutIn {
+                    _format: 0,
+                    label: target,
+                    data: ManageLabelServiceLabelData {
+                        _id: None,
+                        name,
+                        color,
+                        parentLabel: label.parentFolder.clone(),
+                        _errors: Default::default(),
+                    },
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(session_key),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(fail(
+                "label update",
+                Error::LabelFailed,
+                Error::LabelNotFound,
+            ))?;
+        Ok(())
+    }
+
+    /// Delete a label. TS `MailFacade.deleteLabel`: `ManageLabelService`
+    /// DELETE. A label that is already gone counts as deleted.
+    pub async fn delete_label(&self, label_id: &Id) -> Result<()> {
+        let sdk = &*self.sdk;
+        let target = label_id.tuple().clone();
+        let mailbox = load_mailbox(sdk).await?;
+        match find(&mailbox.sets, &target) {
+            None => return Ok(()),
+            Some(set) if !is_label(set) => return Err(Error::LabelNotFound),
+            Some(_) => {}
+        }
+        match sdk
+            .get_service_executor()
+            .delete::<ManageLabelService>(
+                ManageLabelServiceDeleteIn {
+                    _format: 0,
+                    label: target,
+                },
+                ExtraServiceParams::default(),
+            )
+            .await
+        {
+            Ok(())
+            | Err(ApiCallError::ServerResponseError {
+                source: HttpError::NotFoundError,
+            }) => Ok(()),
+            Err(error) => Err(fail(
+                "label delete",
+                Error::LabelFailed,
+                Error::LabelNotFound,
+            )(error)),
         }
     }
-    Ok(batch.rows(ids, |mail| match moved.get(mail) {
-        Some(source) => json!({"new_id": mail, "source": source}),
-        None => json!({"new_id": null, "source": null}),
-    }))
-}
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DeleteMails {
-    pub session: Session,
-    ids: Vec<String>,
-    /// The Trash or Spam folder (or a subfolder) the mails are in; the server
-    /// deletes only what is in it.
-    folder: String,
-}
+    /// Move up to [`MAIL_BATCH_LIMIT`] mails, recording what the server
+    /// reports it moved: Tuta mails keep their id across moves, and
+    /// `MoveMailPostOut.movedMails` names each moved id with its source
+    /// folder -- what the official client's undo moves back
+    /// (`MailGuiUtils.runPostMoveActions`).
+    pub async fn move_mail(&self, ids: &[Id], destination: &Id) -> Result<Vec<MoveOutcome>> {
+        let parsed = check_batch(ids)?;
+        let mut batch = Batch::new(&parsed);
+        let mut moved: HashMap<String, Id> = HashMap::new();
+        for chunk in list_chunks(&parsed) {
+            let reply = self
+                .sdk
+                .get_service_executor()
+                .post::<MoveMailService>(
+                    MoveMailData {
+                        _format: 0,
+                        moveReason: None,
+                        targetFolder: destination.tuple().clone(),
+                        mails: chunk.clone(),
+                        excludeMailSet: None,
+                    },
+                    ExtraServiceParams::default(),
+                )
+                .await;
+            match reply {
+                Ok(reply) => {
+                    for group in reply.movedMails {
+                        for mail in group.mailIds {
+                            moved.insert(
+                                format!("{}/{}", mail.listId, mail.listElementId),
+                                Id::from_tuple(group.sourceFolder.clone()),
+                            );
+                        }
+                    }
+                    batch.settle(&chunk, Outcome::Applied);
+                }
+                Err(error) => {
+                    let code = fail("move", Error::RequestFailed, Error::RequestFailed)(error);
+                    batch.settle(&chunk, Outcome::Failed(code));
+                    break;
+                }
+            }
+        }
+        Ok(ids
+            .iter()
+            .map(|mail| {
+                let source = moved.get(&mail.to_string()).cloned();
+                MoveOutcome {
+                    id: mail.clone(),
+                    code: batch.outcome(mail),
+                    new_id: source.is_some().then(|| mail.clone()),
+                    source,
+                }
+            })
+            .collect())
+    }
 
-/// Permanently delete mails from Trash or Spam. TS
-/// `MailModel.finallyDeleteMails` -> `MailFacade.deleteMails`.
-pub(crate) async fn delete_mails(sdk: &Sdk, request: DeleteMails) -> Result<Value> {
-    let parsed = parse_batch(&request.ids)?;
-    let folder = tuple(&request.folder)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    if find(&mailbox.sets, &folder).is_none() {
-        return Err("folder_not_found");
+    /// Delete up to [`MAIL_BATCH_LIMIT`] mails for good from `folder`, which
+    /// must be Trash, Spam or a folder inside them. TS
+    /// `MailModel.finallyDeleteMails` -> `MailFacade.deleteMails`.
+    pub async fn delete(&self, ids: &[Id], folder: &Id) -> Result<Vec<IdOutcome>> {
+        let parsed = check_batch(ids)?;
+        let folder = folder.tuple();
+        let sdk = &*self.sdk;
+        let mailbox = load_mailbox(sdk).await?;
+        if find(&mailbox.sets, folder).is_none() {
+            return Err(Error::FolderNotFound);
+        }
+        if !in_trash_or_spam(&mailbox.sets, folder) {
+            return Err(Error::NotTrashOrSpam);
+        }
+        let mut batch = Batch::new(&parsed);
+        for chunk in list_chunks(&parsed) {
+            match sdk
+                .get_service_executor()
+                .delete::<MailService>(
+                    DeleteMailData {
+                        _format: 0,
+                        mails: chunk.clone(),
+                        folder: Some(folder.clone()),
+                    },
+                    ExtraServiceParams::default(),
+                )
+                .await
+            {
+                Ok(()) => batch.settle(&chunk, Outcome::Applied),
+                Err(error) => {
+                    let code = fail("delete", Error::DeleteFailed, Error::DeleteFailed)(error);
+                    batch.settle(&chunk, Outcome::Failed(code));
+                    break;
+                }
+            }
+        }
+        Ok(batch.rows(ids))
     }
-    if !in_trash_or_spam(&mailbox.sets, &folder) {
-        return Err("not_trash_or_spam");
-    }
-    let mut batch = Batch::new(&parsed);
-    for chunk in list_chunks(&parsed) {
+
+    /// Empty Trash or Spam; returns how many mails it listed just before.
+    /// TS `MailViewModel.finallyDeleteAllMailsInSelectedFolder` ->
+    /// `MailFacade.clearFolder`: one `MailService` DELETE naming only the
+    /// folder; the server deletes its mail in batches itself. A subfolder of
+    /// Trash or Spam is emptied by deleting it (`delete_folder`), as there.
+    pub async fn empty_folder(&self, folder_id: &Id) -> Result<usize> {
+        let sdk = &*self.sdk;
+        let target = folder_id.tuple().clone();
+        let mailbox = load_mailbox(sdk).await?;
+        let folder = find(&mailbox.sets, &target).ok_or(Error::FolderNotFound)?;
+        if folder.folderType != TRASH_FOLDER_TYPE && folder.folderType != SPAM_FOLDER_TYPE {
+            return Err(Error::NotTrashOrSpam);
+        }
+        let entries: Vec<MailSetEntry> = sdk
+            .mail_facade()
+            .get_crypto_entity_client()
+            // DESC, as `sync` enumerates: the SDK's ASC walk starts at the
+            // generated-id minimum, which skips base64url entry ids.
+            .load_all(&folder.entries, ListLoadDirection::DESC)
+            .await
+            .map_err(fail(
+                "folder entries",
+                Error::RequestFailed,
+                Error::FolderNotFound,
+            ))?;
         match sdk
             .get_service_executor()
             .delete::<MailService>(
                 DeleteMailData {
                     _format: 0,
-                    mails: chunk.clone(),
-                    folder: Some(folder.clone()),
+                    mails: Vec::new(),
+                    folder: Some(target),
                 },
                 ExtraServiceParams::default(),
             )
             .await
         {
-            Ok(()) => batch.settle(&chunk, None),
-            Err(error) => {
-                batch.settle(
-                    &chunk,
-                    Some(fail("delete", "delete_failed", "delete_failed")(error)),
-                );
-                break;
-            }
+            Ok(()) => Ok(entries.len()),
+            Err(ApiCallError::ServerResponseError {
+                source: HttpError::PreconditionFailedError(_),
+            }) => Err(Error::OperationStillActive),
+            Err(error) => Err(fail(
+                "empty folder",
+                Error::DeleteFailed,
+                Error::FolderNotFound,
+            )(error)),
         }
     }
-    Ok(batch.rows(&request.ids, |_| json!({})))
-}
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EmptyFolder {
-    pub session: Session,
-    id: String,
-}
-
-/// Empty Trash or Spam. TS `MailViewModel.finallyDeleteAllMailsInSelectedFolder`
-/// -> `MailFacade.clearFolder`: one `MailService` DELETE naming only the
-/// folder; the server deletes its mail in batches itself. A subfolder of
-/// Trash or Spam is emptied by deleting it (`delete_folder`), as there.
-pub(crate) async fn empty_folder(sdk: &Sdk, request: EmptyFolder) -> Result<Value> {
-    let target = tuple(&request.id)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    let folder = find(&mailbox.sets, &target).ok_or("folder_not_found")?;
-    if folder.folderType != TRASH_FOLDER_TYPE && folder.folderType != SPAM_FOLDER_TYPE {
-        return Err("not_trash_or_spam");
-    }
-    let entries: Vec<MailSetEntry> = sdk
-        .mail_facade()
-        .get_crypto_entity_client()
-        // DESC, as `sync` enumerates: the SDK's ASC walk starts at the
-        // generated-id minimum, which skips base64url entry ids.
-        .load_all(&folder.entries, ListLoadDirection::DESC)
-        .await
-        .map_err(fail("folder entries", "request_failed", "folder_not_found"))?;
-    match sdk
-        .get_service_executor()
-        .delete::<MailService>(
-            DeleteMailData {
-                _format: 0,
-                mails: Vec::new(),
-                folder: Some(target),
-            },
-            ExtraServiceParams::default(),
-        )
-        .await
-    {
-        Ok(()) => Ok(json!({"deleted": entries.len()})),
-        Err(ApiCallError::ServerResponseError {
-            source: HttpError::PreconditionFailedError(_),
-        }) => Err("operation_still_active"),
-        Err(error) => Err(fail("empty folder", "delete_failed", "folder_not_found")(
-            error,
-        )),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ApplyLabels {
-    pub session: Session,
-    ids: Vec<String>,
-    add: Vec<String>,
-    remove: Vec<String>,
-}
-
-/// Validated label changes: no overlap, at most `MAX_LABELS_PER_MAIL` added.
-fn label_changes(request: &ApplyLabels) -> Result<(Vec<IdTupleGenerated>, Vec<IdTupleGenerated>)> {
-    let add = request
-        .add
-        .iter()
-        .map(|s| tuple(s))
-        .collect::<Result<Vec<_>>>()?;
-    let remove = request
-        .remove
-        .iter()
-        .map(|s| tuple(s))
-        .collect::<Result<Vec<_>>>()?;
-    if (add.is_empty() && remove.is_empty())
-        || add.len() > MAX_LABELS_PER_MAIL
-        || add.iter().any(|label| remove.contains(label))
-    {
-        return Err("invalid_request");
-    }
-    Ok((add, remove))
-}
-
-/// TS `MailModel.applyLabels` -> `MailFacade.applyLabels`: `ApplyLabelService`
-/// POST per mail list, in chunks.
-pub(crate) async fn apply_labels(sdk: &Sdk, request: ApplyLabels) -> Result<Value> {
-    let parsed = parse_batch(&request.ids)?;
-    let (add, remove) = label_changes(&request)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
-    let mailbox = load_mailbox(sdk).await?;
-    if add
-        .iter()
-        .chain(remove.iter())
-        .any(|label| !find(&mailbox.sets, label).is_some_and(is_label))
-    {
-        return Err("label_not_found");
-    }
-    let mut batch = Batch::new(&parsed);
-    for chunk in list_chunks(&parsed) {
-        match sdk
-            .get_service_executor()
-            .post::<ApplyLabelService>(
-                ApplyLabelServicePostIn {
-                    _format: 0,
-                    mails: chunk.clone(),
-                    addedLabels: add.clone(),
-                    removedLabels: remove.clone(),
-                },
-                ExtraServiceParams::default(),
-            )
-            .await
+    /// Add and remove labels on up to [`MAIL_BATCH_LIMIT`] mails. TS
+    /// `MailModel.applyLabels` -> `MailFacade.applyLabels`:
+    /// `ApplyLabelService` POST per mail list, in chunks.
+    pub async fn apply_labels(&self, ids: &[Id], changes: &LabelChanges) -> Result<Vec<IdOutcome>> {
+        let parsed = check_batch(ids)?;
+        let sdk = &*self.sdk;
+        let mailbox = load_mailbox(sdk).await?;
+        if changes
+            .add
+            .iter()
+            .chain(changes.remove.iter())
+            .any(|label| !find(&mailbox.sets, label).is_some_and(is_label))
         {
-            Ok(()) => batch.settle(&chunk, None),
-            Err(error) => {
-                batch.settle(
-                    &chunk,
-                    Some(fail("apply labels", "label_failed", "request_failed")(
-                        error,
-                    )),
-                );
-                break;
+            return Err(Error::LabelNotFound);
+        }
+        let mut batch = Batch::new(&parsed);
+        for chunk in list_chunks(&parsed) {
+            match sdk
+                .get_service_executor()
+                .post::<ApplyLabelService>(
+                    ApplyLabelServicePostIn {
+                        _format: 0,
+                        mails: chunk.clone(),
+                        addedLabels: changes.add.clone(),
+                        removedLabels: changes.remove.clone(),
+                    },
+                    ExtraServiceParams::default(),
+                )
+                .await
+            {
+                Ok(()) => batch.settle(&chunk, Outcome::Applied),
+                Err(error) => {
+                    let code =
+                        fail("apply labels", Error::LabelFailed, Error::RequestFailed)(error);
+                    batch.settle(&chunk, Outcome::Failed(code));
+                    break;
+                }
             }
         }
+        Ok(batch.rows(ids))
     }
-    Ok(batch.rows(&request.ids, |_| json!({})))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::tuple;
 
     fn set(element: &str, kind: i64, parent: Option<&str>) -> MailSet {
         MailSet {
@@ -1052,6 +1039,10 @@ mod tests {
 
     fn t(element: &str) -> IdTupleGenerated {
         tuple(&format!("sets/{element}")).unwrap()
+    }
+
+    fn ids(values: &[&str]) -> Vec<Id> {
+        values.iter().map(|v| Id::parse(v).unwrap()).collect()
     }
 
     #[test]
@@ -1099,17 +1090,17 @@ mod tests {
 
     #[test]
     fn names_and_colours_are_validated() {
-        assert_eq!(valid_name("  Work  ").unwrap(), "Work");
-        assert_eq!(valid_name("   "), Err("invalid_name"));
-        assert_eq!(valid_name("a\u{7}b"), Err("invalid_name"));
+        assert_eq!(Name::new("  Work  ").unwrap().as_str(), "Work");
+        assert_eq!(Name::new("   "), Err(Error::InvalidName));
+        assert_eq!(Name::new("a\u{7}b"), Err(Error::InvalidName));
         assert_eq!(
-            valid_name(&"x".repeat(MAX_NAME_CHARS + 1)),
-            Err("invalid_name")
+            Name::new(&"x".repeat(MAX_NAME_CHARS + 1)),
+            Err(Error::InvalidName)
         );
-        assert_eq!(valid_color("#A1b2C3").unwrap(), "#a1b2c3");
-        assert_eq!(valid_color("a1b2c3"), Err("invalid_color"));
-        assert_eq!(valid_color("#a1b2c"), Err("invalid_color"));
-        assert_eq!(valid_color("#a1b2cg"), Err("invalid_color"));
+        assert_eq!(Color::new("#A1b2C3").unwrap().as_str(), "#a1b2c3");
+        assert_eq!(Color::new("a1b2c3"), Err(Error::InvalidColor));
+        assert_eq!(Color::new("#a1b2c"), Err(Error::InvalidColor));
+        assert_eq!(Color::new("#a1b2cg"), Err(Error::InvalidColor));
     }
 
     #[test]
@@ -1145,149 +1136,129 @@ mod tests {
 
     #[test]
     fn batch_rows_keep_input_order_and_mark_the_unattempted() {
-        let ids: Vec<String> = ["a/1", "b/2", "a/1"].map(String::from).to_vec();
-        let parsed = parse_batch(&ids).unwrap();
+        let ids = ids(&["a/1", "b/2", "a/1"]);
+        let parsed = check_batch(&ids).unwrap();
         let mut batch = Batch::new(&parsed);
-        batch.settle(&parsed[..1], None);
-        let rows = batch.rows(&ids, |m| json!({"new_id": m}));
-        let rows = rows["outcomes"].as_array().unwrap();
+        batch.settle(&parsed[..1], Outcome::Applied);
+        let rows = batch.rows(&ids);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["code"], Value::Null);
-        assert_eq!(rows[1]["code"], "not_attempted");
-        assert_eq!(rows[2]["code"], Value::Null);
-        assert_eq!(rows[1]["new_id"], "b/2");
+        assert_eq!(rows[0].code, Outcome::Applied);
+        assert_eq!(rows[1].code, Outcome::NotAttempted);
+        assert_eq!(rows[2].code, Outcome::Applied);
+        assert_eq!(rows[1].id.to_string(), "b/2");
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["code"], serde_json::Value::Null);
+        assert_eq!(json[1]["code"], "not_attempted");
+    }
+
+    #[test]
+    fn move_rows_serialize_their_report() {
+        let row = MoveOutcome {
+            id: Id::parse("a/1").unwrap(),
+            code: Outcome::Failed(Error::RequestFailed),
+            new_id: None,
+            source: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            serde_json::json!({"id": "a/1", "code": "request_failed", "new_id": null, "source": null})
+        );
     }
 
     #[test]
     fn batches_are_bounded() {
-        assert_eq!(parse_batch(&[]).err(), Some("invalid_batch"));
-        let many: Vec<String> = (0..=MAIL_BATCH_LIMIT).map(|n| format!("a/m{n}")).collect();
-        assert_eq!(parse_batch(&many).err(), Some("invalid_batch"));
-        assert_eq!(parse_batch(&["nope".into()]).err(), Some("invalid_id"));
-    }
-
-    fn rename(name: Option<&str>, parent: Option<&str>) -> RenameFolder {
-        serde_json::from_value(json!({
-            "session": {"login": "", "user_id": "", "access_token": "", "encrypted_passphrase_key": []},
-            "id": "sets/f", "name": name, "parent": parent,
-        }))
-        .unwrap()
+        assert_eq!(check_batch(&[]).err(), Some(Error::InvalidBatch));
+        let many: Vec<Id> = (0..=MAIL_BATCH_LIMIT)
+            .map(|n| Id::parse(&format!("a/m{n}")).unwrap())
+            .collect();
+        assert_eq!(check_batch(&many).err(), Some(Error::InvalidBatch));
+        assert_eq!(
+            check_batch(&many[1..]).map(|b| b.len()),
+            Ok(MAIL_BATCH_LIMIT)
+        );
     }
 
     #[test]
     fn folder_edits_need_a_change_and_a_sane_parent() {
+        let folder = || Id::parse("sets/f").unwrap();
         assert_eq!(
-            folder_edit(&rename(None, None)).err(),
-            Some("invalid_request")
+            FolderEdit::new(folder(), None, None).err(),
+            Some(Error::InvalidRequest)
         );
         assert_eq!(
-            folder_edit(&rename(None, Some("sets/f"))).err(),
-            Some("invalid_parent")
+            FolderEdit::new(folder(), None, Some(Some(folder()))).err(),
+            Some(Error::InvalidParent)
         );
-        let top = folder_edit(&rename(None, Some(""))).unwrap();
+        let top = FolderEdit::new(folder(), None, Some(None)).unwrap();
         assert_eq!(top.parent, Some(None));
-        let named = folder_edit(&rename(Some(" New "), None)).unwrap();
-        assert_eq!(named.name.as_deref(), Some("New"));
+        let named = FolderEdit::new(folder(), Some(Name::new(" New ").unwrap()), None).unwrap();
+        assert_eq!(named.name.as_ref().map(Name::as_str), Some("New"));
         assert!(named.parent.is_none());
     }
 
-    fn labels(add: &[&str], remove: &[&str]) -> ApplyLabels {
-        serde_json::from_value(json!({
-            "session": {"login": "", "user_id": "", "access_token": "", "encrypted_passphrase_key": []},
-            "ids": ["a/1"], "add": add, "remove": remove,
-        }))
-        .unwrap()
+    #[test]
+    fn label_edits_need_a_change() {
+        assert_eq!(
+            LabelEdit::new(None, None).err(),
+            Some(Error::InvalidRequest)
+        );
+        assert!(LabelEdit::new(None, Some(Color::new("#000000").unwrap())).is_ok());
     }
 
     #[test]
     fn label_changes_are_validated() {
+        let changes = |add: &[&str], remove: &[&str]| LabelChanges::new(ids(add), ids(remove));
+        assert_eq!(changes(&[], &[]).err(), Some(Error::InvalidRequest));
         assert_eq!(
-            label_changes(&labels(&[], &[])).err(),
-            Some("invalid_request")
+            changes(&["l/1"], &["l/1"]).err(),
+            Some(Error::InvalidRequest)
         );
         assert_eq!(
-            label_changes(&labels(&["l/1"], &["l/1"])).err(),
-            Some("invalid_request")
+            changes(&["l/1", "l/2", "l/3", "l/4", "l/5", "l/6"], &[]).err(),
+            Some(Error::InvalidRequest)
         );
-        assert_eq!(
-            label_changes(&labels(&["l/1", "l/2", "l/3", "l/4", "l/5", "l/6"], &[])).err(),
-            Some("invalid_request")
-        );
-        assert_eq!(
-            label_changes(&labels(&["bad"], &[])).err(),
-            Some("invalid_id")
-        );
-        let (add, remove) = label_changes(&labels(&["l/1"], &["l/2"])).unwrap();
-        assert_eq!((add.len(), remove.len()), (1, 1));
+        let valid = changes(&["l/1"], &["l/2"]).unwrap();
+        assert_eq!((valid.add.len(), valid.remove.len()), (1, 1));
     }
 
     #[test]
     fn mail_labels_keep_only_labels() {
         let sets = vec![t("inbox"), t("tag")];
         let label_ids: HashSet<String> = [id(&t("tag"))].into_iter().collect();
-        assert_eq!(mail_labels(&sets, &label_ids), [id(&t("tag"))]);
+        assert_eq!(mail_labels(&sets, &label_ids), [Id::from_tuple(t("tag"))]);
     }
 
     #[test]
     fn api_codes_are_fixed() {
         let server = |source| ApiCallError::ServerResponseError { source };
+        let (fallback, gone) = (Error::FolderFailed, Error::FolderNotFound);
         assert_eq!(
-            api_code(server(HttpError::NotFoundError), "x", "gone"),
-            "gone"
+            api_code(server(HttpError::NotFoundError), fallback, gone),
+            gone
         );
         assert_eq!(
-            api_code(server(HttpError::SessionExpiredError), "x", "gone"),
-            "session_revoked"
+            api_code(server(HttpError::SessionExpiredError), fallback, gone),
+            Error::SessionRevoked
         );
         assert_eq!(
-            api_code(server(HttpError::LimitReachedError), "x", "gone"),
-            "limit_reached"
+            api_code(server(HttpError::LimitReachedError), fallback, gone),
+            Error::LimitReached
         );
         assert_eq!(
-            api_code(server(HttpError::BadRequestError), "x", "gone"),
-            "x"
+            api_code(server(HttpError::BadRequestError), fallback, gone),
+            fallback
         );
         assert_eq!(
-            api_code(ApiCallError::internal("secret".into()), "x", "gone"),
-            "x"
+            api_code(ApiCallError::internal("secret".into()), fallback, gone),
+            fallback
         );
     }
 
     #[test]
-    fn new_ops_parse_through_the_envelope_and_refuse_unknown_fields() {
-        let session =
-            json!({"login": "", "user_id": "", "access_token": "", "encrypted_passphrase_key": []});
-        let parses = |request: Value| serde_json::from_value::<crate::Request>(request).is_ok();
-        let requests = [
-            json!({"op": "list_labels"}),
-            json!({"op": "create_folder", "name": "x"}),
-            json!({"op": "create_folder", "name": "x", "parent": "a/b"}),
-            json!({"op": "rename_folder", "id": "a/b", "name": "y"}),
-            json!({"op": "rename_folder", "id": "a/b", "parent": ""}),
-            json!({"op": "delete_folder", "id": "a/b"}),
-            json!({"op": "create_label", "name": "x", "color": "#000000"}),
-            json!({"op": "update_label", "id": "a/b", "color": "#000000"}),
-            json!({"op": "delete_label", "id": "a/b"}),
-            json!({"op": "apply_labels", "ids": ["a/b"], "add": ["l/1"], "remove": []}),
-            json!({"op": "delete", "ids": ["a/b"], "folder": "t/t"}),
-            json!({"op": "empty_folder", "id": "t/t"}),
-            json!({"op": "delete_draft", "id": "a/b"}),
-            json!({"op": "watch"}),
-        ];
-        for mut request in requests {
-            let fields = request.as_object_mut().unwrap();
-            fields.insert("version".into(), json!(1));
-            fields.insert("session".into(), session.clone());
-            assert!(parses(request.clone()), "{request}");
-            request
-                .as_object_mut()
-                .unwrap()
-                .insert("unexpected".into(), json!(true));
-            assert!(!parses(request.clone()), "{request}");
-        }
-        // Required fields stay required.
-        assert!(!parses(
-            json!({"version": 1, "op": "delete", "session": session, "ids": ["a/b"]})
-        ));
+    fn deletions_serialize_as_the_protocol_names_them() {
+        assert_eq!(
+            serde_json::to_value(FolderDeletion::Trashed).unwrap(),
+            serde_json::json!("trashed")
+        );
     }
 }

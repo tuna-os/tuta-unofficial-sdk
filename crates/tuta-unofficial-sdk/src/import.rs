@@ -16,9 +16,14 @@
 //!
 //! The MIME conversion is upstream's own (see `mime`). Nothing here talks
 //! IMAP: the server files the mail from the encrypted data alone.
-use super::{aggregate_id, diag, id, resume, tuple, Result, Session};
-use crate::mailbox_ops::{api_code, load_mailbox, IMPORTED_FOLDER_TYPE, LABEL_FOLDER_TYPE};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::{
+    diag,
+    error::api_code,
+    ids::Id,
+    mailbox_ops::{load_mailbox, IMPORTED_FOLDER_TYPE, LABEL_FOLDER_TYPE},
+    send::aggregate_id,
+    Error, Result, Session,
+};
 use crypto_primitives::{
     aes::{Aes256Key, InitializationVector},
     key::GenericAesKey,
@@ -26,8 +31,6 @@ use crypto_primitives::{
     versioned::VersionedAesKey,
 };
 use mail_parser::MessageParser;
-use serde::Deserialize;
-use serde_json::{json, Value};
 use std::time::Duration;
 use tutasdk::{
     blobs::blob_facade::FileData,
@@ -44,7 +47,7 @@ use tutasdk::{
     rest_error::{HttpError, ImportFailureReason, PreconditionFailedReason},
     services::{generated::tutanota::ImportMailService, ExtraServiceParams},
     tutanota_constants::{ArchiveDataType, PlanType},
-    ApiCallError, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk, Sdk,
+    ApiCallError, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk,
 };
 
 mod mime;
@@ -53,10 +56,8 @@ use mime::{ImportableMail, ImportableMailAttachment};
 
 /// The largest message taken, decoded. Tuta caps a sent mail's attachments
 /// at 25 MiB; a message past that is not one Tuta would carry either, and
-/// the cap bounds what the helper holds: the request (`MAX_REQUEST_BYTES`
-/// in `main.rs` leaves room for this much in base64), the decoded bytes and
-/// the parsed parts.
-pub(crate) const MAX_IMPORT_BYTES: usize = 25 * 1024 * 1024;
+/// the cap bounds what is held: the decoded bytes and the parsed parts.
+pub const MAX_IMPORT_BYTES: usize = 25 * 1024 * 1024;
 /// The most MIME parts a message may have. Upstream sets none, but every
 /// non-body part becomes a blob upload and an attachment entry, so a
 /// pathological message of tiny parts would cost thousands of each.
@@ -75,8 +76,8 @@ const IMPORTED_MAIL_SET_NAME: &str = "@internal-mailset";
 const IMPORT_STATUS_CANCELED: i64 = 2;
 const IMPORT_STATUS_FINISHED: i64 = 3;
 /// How often, and how far apart, the imported-mail list is read before the
-/// mail is reported without its id. The whole run must stay inside the
-/// helper's 90-second budget.
+/// mail is reported without its id. The whole run must stay inside
+/// `tuta-helper`'s 90-second budget per operation.
 const RESOLVE_ATTEMPTS: u32 = 8;
 const RESOLVE_DELAY: Duration = Duration::from_millis(750);
 
@@ -85,36 +86,32 @@ const RESOLVE_DELAY: Duration = Duration::from_millis(750);
 /// an import; the server answers any other plan's import with a bare 400.
 const IMPORT_PLANS: [i64; 2] = [PlanType::Legend as i64, PlanType::Unlimited as i64];
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Import {
-    pub session: Session,
-    /// The target folder's compound id.
-    folder: String,
-    /// The whole message, standard base64.
-    mime_base64: String,
-    /// Upstream imports every mail read; a caller moving an unread mail in
-    /// from elsewhere can keep it unread.
-    #[serde(default)]
-    unread: bool,
+/// A message to import, converted by a port of the official desktop
+/// importer and checked before any I/O.
+pub struct ImportMessage {
+    mail: ImportableMail,
 }
 
-/// The target and the converted message, checked before any I/O.
-fn prepare(request: &Import) -> Result<(IdTupleGenerated, ImportableMail)> {
-    let folder = tuple(&request.folder)?;
-    // Refused before decoding, so an oversized request costs no copy.
-    if request.mime_base64.len() > MAX_IMPORT_BYTES.div_ceil(3) * 4 {
-        return Err("import_too_large");
+impl std::fmt::Debug for ImportMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportMessage").finish_non_exhaustive()
     }
-    let bytes = STANDARD
-        .decode(request.mime_base64.as_bytes())
-        .map_err(|_| "invalid_request")?;
-    if bytes.len() > MAX_IMPORT_BYTES {
-        return Err("import_too_large");
+}
+
+impl ImportMessage {
+    /// Convert a whole RFC 5322 message. It is filed read unless `unread`
+    /// (upstream imports every mail read; a caller moving an unread mail in
+    /// from elsewhere can keep it unread). Over [`MAX_IMPORT_BYTES`] or 256
+    /// MIME parts is [`Error::ImportTooLarge`]; no header at all is
+    /// [`Error::ImportInvalid`].
+    pub fn parse(bytes: &[u8], unread: bool) -> Result<Self> {
+        if bytes.len() > MAX_IMPORT_BYTES {
+            return Err(Error::ImportTooLarge);
+        }
+        let mut mail = convert(bytes)?;
+        mail.unread = unread;
+        Ok(ImportMessage { mail })
     }
-    let mut mail = convert(&bytes)?;
-    mail.unread = request.unread;
-    Ok((folder, mail))
 }
 
 /// The message as upstream's importer reads it. Anything without a header
@@ -122,12 +119,12 @@ fn prepare(request: &Import) -> Result<(IdTupleGenerated, ImportableMail)> {
 fn convert(bytes: &[u8]) -> Result<ImportableMail> {
     let message = MessageParser::default()
         .parse(bytes)
-        .ok_or("import_invalid")?;
+        .ok_or(Error::ImportInvalid)?;
     if message.headers_raw().next().is_none() {
-        return Err("import_invalid");
+        return Err(Error::ImportInvalid);
     }
     if message.parts.len() > MAX_IMPORT_PARTS {
-        return Err("import_too_large");
+        return Err(Error::ImportTooLarge);
     }
     Ok(ImportableMail::from_parsed_message(&message))
 }
@@ -146,7 +143,7 @@ fn importable(folder_type: i64) -> bool {
 }
 
 /// The code a failed import call reports, with a diagnostic line.
-fn fail(stage: &'static str) -> impl FnOnce(ApiCallError) -> &'static str {
+fn fail(stage: &'static str) -> impl FnOnce(ApiCallError) -> Error {
     move |error| {
         diag::failed(stage, &error);
         match &error {
@@ -157,10 +154,10 @@ fn fail(stage: &'static str) -> impl FnOnce(ApiCallError) -> &'static str {
                     ))),
             } => match reason {
                 // Import is off for this account's plan, or for now.
-                ImportFailureReason::ImportDisabled => "import_refused",
-                ImportFailureReason::ImportTargetFolderDeleted => "folder_not_found",
+                ImportFailureReason::ImportDisabled => Error::ImportRefused,
+                ImportFailureReason::ImportTargetFolderDeleted => Error::FolderNotFound,
             },
-            _ => api_code(error, "import_failed", "folder_not_found"),
+            _ => api_code(error, Error::ImportFailed, Error::FolderNotFound),
         }
     }
 }
@@ -183,12 +180,25 @@ async fn plan_allows_import(sdk: &LoggedInSdk) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) async fn import(sdk: &Sdk, request: Import) -> Result<Value> {
-    let (folder, mut mail) = prepare(&request)?;
-    let logged_in = resume(sdk, request.session).await?;
-    let sdk = &*logged_in;
+impl Session {
+    /// File one message into `folder` (not a label, the IMPORTED set or the
+    /// scheduled-mail set), end-to-end encrypted like any other mail, the
+    /// way the official desktop client imports a mail file. Needs a Legend
+    /// or Unlimited plan ([`Error::ImportRefused`] otherwise, before
+    /// anything is written). Returns the new mail's id, or None when the
+    /// server had not listed it yet; the mail is in either way.
+    pub async fn import(&self, folder: &Id, message: ImportMessage) -> Result<Option<Id>> {
+        import(&self.sdk, folder.tuple().clone(), message.mail).await
+    }
+}
+
+async fn import(
+    sdk: &LoggedInSdk,
+    folder: IdTupleGenerated,
+    mut mail: ImportableMail,
+) -> Result<Option<Id>> {
     if !plan_allows_import(sdk).await? {
-        return Err("import_refused");
+        return Err(Error::ImportRefused);
     }
     let mailbox = load_mailbox(sdk).await?;
     match mailbox
@@ -197,7 +207,7 @@ pub(crate) async fn import(sdk: &Sdk, request: Import) -> Result<Value> {
         .find(|set| set._id.as_ref() == Some(&folder))
     {
         Some(set) if importable(set.folderType) => {}
-        _ => return Err("folder_not_found"),
+        _ => return Err(Error::FolderNotFound),
     }
     let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
     let group_key = sdk
@@ -208,11 +218,11 @@ pub(crate) async fn import(sdk: &Sdk, request: Import) -> Result<Value> {
     let session_key = GenericAesKey::Aes256(Aes256Key::generate(&randomizer));
     let owner_enc =
         group_key.encrypt_key(&session_key, InitializationVector::generate(&randomizer));
-    let version = i64::try_from(owner_enc.version).map_err(|_| "import_failed")?;
+    let version = i64::try_from(owner_enc.version).map_err(|_| Error::ImportFailed)?;
     let attachments = mail.take_out_attachments();
     let data = mail.make_import_mail_data(owner_enc.object, version);
     if estimate_json_size(&data) > MAX_IMPORT_DATA_BYTES {
-        return Err("import_too_large");
+        return Err(Error::ImportTooLarge);
     }
     let state = create_state(sdk, &randomizer, &group_key, &mailbox.group, folder).await?;
     let staged = Staged {
@@ -226,7 +236,7 @@ pub(crate) async fn import(sdk: &Sdk, request: Import) -> Result<Value> {
         Ok(()) => {
             let mail_id = staged.resolve(RESOLVE_ATTEMPTS).await;
             staged.finalise(IMPORT_STATUS_FINISHED, 1, 0).await;
-            Ok(json!({"id": mail_id}))
+            Ok(mail_id)
         }
         Err(code) => {
             staged.finalise(IMPORT_STATUS_CANCELED, 0, 1).await;
@@ -254,7 +264,8 @@ async fn create_state(
                 newImportedMailSetName: IMPORTED_MAIL_SET_NAME.to_string(),
                 ownerEncSessionKey: owner_enc.object,
                 ownerGroup: group.clone(),
-                ownerKeyVersion: i64::try_from(owner_enc.version).map_err(|_| "import_failed")?,
+                ownerKeyVersion: i64::try_from(owner_enc.version)
+                    .map_err(|_| Error::ImportFailed)?,
                 totalMails: 1,
                 targetMailFolder: folder,
                 _errors: Default::default(),
@@ -320,7 +331,7 @@ impl Staged<'_> {
             Ok(_) => Ok(()),
             Err(error) => {
                 let code = fail("import post")(error);
-                if code != "import_refused" && self.imported_mail().await.is_some() {
+                if code != Error::ImportRefused && self.imported_mail().await.is_some() {
                     return Ok(());
                 }
                 Err(code)
@@ -355,7 +366,7 @@ impl Staged<'_> {
         // One token list per file, in upload order; anything else would pair
         // a file with another's blobs.
         if tokens.len() != attachments.len() {
-            return Err("import_failed");
+            return Err(Error::ImportFailed);
         }
         attachments
             .iter()
@@ -369,7 +380,7 @@ impl Staged<'_> {
                         &file.session_key,
                         tokens,
                     )
-                    .ok_or("import_failed")
+                    .ok_or(Error::ImportFailed)
             })
             .collect()
     }
@@ -384,7 +395,7 @@ impl Staged<'_> {
             .servers
             .last()
             .map(|server| server.url.clone())
-            .ok_or("import_failed")
+            .ok_or(Error::ImportFailed)
     }
 
     async fn load_state(&self) -> Option<ImportFileMailState> {
@@ -415,13 +426,13 @@ impl Staged<'_> {
 
     /// The imported mail's id. `None` when the list did not name it in time:
     /// the mail is in, and the caller relists the folder all the same.
-    async fn resolve(&self, attempts: u32) -> Option<String> {
+    async fn resolve(&self, attempts: u32) -> Option<Id> {
         for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(RESOLVE_DELAY).await;
             }
             if let Some(mail) = self.imported_mail().await {
-                return Some(id(&mail));
+                return Some(Id::from_tuple(mail));
             }
         }
         diag::note("imported mail not listed in time");
@@ -475,27 +486,13 @@ mod tests {
         AAECAw==\r\n\
         --b--\r\n";
 
-    fn request(fields: Value) -> std::result::Result<Import, serde_json::Error> {
-        let mut base = json!({
-            "session": {"login": "l", "user_id": "u", "access_token": "t",
-                "encrypted_passphrase_key": []},
-            "folder": "list/element",
-            "mime_base64": STANDARD.encode(RAW),
-        });
-        for (key, value) in fields.as_object().unwrap() {
-            base[key] = value.clone();
-        }
-        serde_json::from_value(base)
-    }
-
-    fn prepared(fields: Value) -> Result<(IdTupleGenerated, ImportableMail)> {
-        prepare(&request(fields).unwrap())
+    fn parsed(unread: bool) -> ImportableMail {
+        ImportMessage::parse(RAW.as_bytes(), unread).unwrap().mail
     }
 
     #[test]
     fn a_message_converts_with_its_attachment() {
-        let (folder, mut mail) = prepared(json!({})).unwrap();
-        assert_eq!(id(&folder), "list/element");
+        let mut mail = parsed(false);
         assert_eq!(mail.subject, "token-123");
         assert_eq!(mail.html_body_text, "Hello &lt;you&gt;");
         assert_eq!(mail.message_id.as_deref(), Some("m1@example.org"));
@@ -515,54 +512,38 @@ mod tests {
 
     #[test]
     fn unread_is_the_callers_choice() {
-        let (_, mail) = prepared(json!({"unread": true})).unwrap();
-        assert!(mail.unread);
+        assert!(parsed(true).unread);
     }
 
     #[test]
-    fn requests_are_checked_before_any_io() {
+    fn messages_are_checked_before_any_io() {
         assert_eq!(
-            prepared(json!({"folder": "nope"})).err(),
-            Some("invalid_id")
+            ImportMessage::parse(b"", false).err(),
+            Some(Error::ImportInvalid)
         );
         assert_eq!(
-            prepared(json!({"folder": "a/b/c"})).err(),
-            Some("invalid_id")
+            ImportMessage::parse(&vec![b'a'; MAX_IMPORT_BYTES + 1], false).err(),
+            Some(Error::ImportTooLarge)
         );
-        assert_eq!(
-            prepared(json!({"mime_base64": "not base64!"})).err(),
-            Some("invalid_request")
-        );
-        assert_eq!(
-            prepared(json!({"mime_base64": ""})).err(),
-            Some("import_invalid")
-        );
-        assert!(request(json!({"extra": 1})).is_err(), "unknown fields");
-        let mut without = json!({});
-        without["mime_base64"] = Value::Null;
-        assert!(request(without).is_err(), "the message is required");
     }
 
     #[test]
     fn a_body_without_headers_is_not_a_message() {
-        assert_eq!(convert(b"\r\n\r\njust text").err(), Some("import_invalid"));
+        assert_eq!(
+            convert(b"\r\n\r\njust text").err(),
+            Some(Error::ImportInvalid)
+        );
     }
 
     #[test]
     fn size_and_part_caps_hold() {
-        // Over the cap in base64 is refused before decoding.
-        let over = "A".repeat(MAX_IMPORT_BYTES.div_ceil(3) * 4 + 4);
-        assert_eq!(
-            prepared(json!({"mime_base64": over})).err(),
-            Some("import_too_large")
-        );
         let mut many =
             String::from("Subject: x\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n");
         for _ in 0..MAX_IMPORT_PARTS {
             many.push_str("--b\r\nContent-Type: text/plain\r\n\r\nx\r\n");
         }
         many.push_str("--b--\r\n");
-        assert_eq!(convert(many.as_bytes()).err(), Some("import_too_large"));
+        assert_eq!(convert(many.as_bytes()).err(), Some(Error::ImportTooLarge));
     }
 
     #[test]
@@ -588,24 +569,24 @@ mod tests {
         };
         assert_eq!(
             fail("t")(precondition(ImportFailureReason::ImportDisabled)),
-            "import_refused"
+            Error::ImportRefused
         );
         assert_eq!(
             fail("t")(precondition(ImportFailureReason::ImportTargetFolderDeleted)),
-            "folder_not_found"
+            Error::FolderNotFound
         );
         let plain = |source| ApiCallError::ServerResponseError { source };
         assert_eq!(
             fail("t")(plain(HttpError::NotFoundError)),
-            "folder_not_found"
+            Error::FolderNotFound
         );
         assert_eq!(
             fail("t")(plain(HttpError::BadRequestError)),
-            "import_failed"
+            Error::ImportFailed
         );
         assert_eq!(
             fail("t")(plain(HttpError::NotAuthenticatedError)),
-            "session_revoked"
+            Error::SessionRevoked
         );
     }
 }

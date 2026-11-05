@@ -1,21 +1,44 @@
-//! Opt-in diagnostics on stderr, off unless `HYLKI_TUTA_DEBUG=1`. With
-//! the variable unset nothing is printed at all. What is printed is the Debug
-//! form of an SDK error and the name of the stage it broke, passed through
-//! [`redact`] first: addresses, ids, tokens and key bytes never leave the
-//! process. Callers pass errors and stage names only, never message content.
+//! Opt-in diagnostics on stderr, off unless `TUTA_SDK_DEBUG=1` is set or a
+//! program turns them on with [`enable`]. Off, nothing is printed at all.
+//! What is printed is the Debug form of an SDK error and the name of the
+//! stage it broke, passed through [`redact`] first: addresses, ids, tokens
+//! and key bytes never leave the process. Callers pass errors and stage
+//! names only, never message content.
 
-use std::{fmt::Debug, sync::LazyLock};
+use std::{
+    fmt::Debug,
+    sync::{LazyLock, RwLock},
+};
 
-static ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("HYLKI_TUTA_DEBUG").is_some_and(|v| v == "1"));
+/// The line prefix when diagnostics are on through the environment.
+const DEFAULT_PREFIX: &str = "tuta-sdk";
 
-/// Whether diagnostics are on for this run.
+static FROM_ENV: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("TUTA_SDK_DEBUG").is_some_and(|v| v == "1"));
+
+/// The prefix of an explicit [`enable`]; None until one.
+static ENABLED_AS: RwLock<Option<&'static str>> = RwLock::new(None);
+
+fn explicit() -> Option<&'static str> {
+    *ENABLED_AS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Turn diagnostics on for this process, each line prefixed `prefix:`.
+pub fn enable(prefix: &'static str) {
+    *ENABLED_AS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(prefix);
+}
+
+/// Whether diagnostics are on for this process.
 pub fn enabled() -> bool {
-    *ENABLED
+    explicit().is_some() || *FROM_ENV
 }
 
 /// Report that `stage` failed with `error`.
-pub fn failed(stage: &str, error: &dyn Debug) {
+pub(crate) fn failed(stage: &str, error: &dyn Debug) {
     if enabled() {
         note(&format!("{stage} failed: {error:?}"));
     }
@@ -23,7 +46,10 @@ pub fn failed(stage: &str, error: &dyn Debug) {
 
 /// A `map_err` adapter: report the error against `stage`, then fail with
 /// `code`, the only thing the caller ever sees.
-pub fn fail<E: Debug>(stage: &'static str, code: &'static str) -> impl FnOnce(E) -> &'static str {
+pub(crate) fn fail<E: Debug>(
+    stage: &'static str,
+    code: crate::Error,
+) -> impl FnOnce(E) -> crate::Error {
     move |error| {
         failed(stage, &error);
         code
@@ -31,9 +57,10 @@ pub fn fail<E: Debug>(stage: &'static str, code: &'static str) -> impl FnOnce(E)
 }
 
 /// Print one redacted diagnostic line.
-pub fn note(text: &str) {
+pub(crate) fn note(text: &str) {
     if enabled() {
-        eprintln!("hylki-tuta: {}", redact(text));
+        let prefix = explicit().unwrap_or(DEFAULT_PREFIX);
+        eprintln!("{prefix}: {}", redact(text));
     }
 }
 

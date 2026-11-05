@@ -4,34 +4,40 @@
 //! The official client reads a recipient's password from their contact's
 //! `presharedPassword` and writes it back there when a send changed it
 //! (`SendMailModel.updateContacts`), so every Tuta app the user signs in to
-//! offers the same password next time. The helper does the same, through the
-//! SDK's `ContactFacade` (`sdk-patches/04-secure-external-recipient.patch`).
+//! offers the same password next time. This crate does the same, through
+//! the SDK's `ContactFacade` (`sdk-patches/04-secure-external-recipient.patch`).
 //!
-//! Passwords are secrets: they are held in `Zeroizing` strings, have no Debug
-//! form, and never reach the diagnostics.
+//! Passwords are secrets: they are held in `Zeroizing` strings or
+//! `SecretString`s, have no Debug form, and never reach the diagnostics.
 
-use crate::{classify_recipients, diag, resume, valid_address, RecipientKind, Result, Session};
+use crate::{
+    diag,
+    send::{classify_recipients, valid_address, RecipientKind},
+    Error, Result, Session,
+};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{
     de::{MapAccess, Visitor},
-    Deserialize, Deserializer,
+    Deserialize, Deserializer, Serialize, Serializer,
 };
-use serde_json::{json, Value};
 use std::fmt;
 use tutasdk::{
     entities::generated::tutanota::{Contact, ContactMailAddress},
-    ApiCallError, GeneratedId, LoggedInSdk, Sdk,
+    ApiCallError, GeneratedId, LoggedInSdk,
 };
 use zeroize::Zeroizing;
 
-/// The most addresses one `contact_passwords` or `store_contact_passwords`
-/// takes: a composer's recipients, not an address book.
-const MAX_ADDRESSES: usize = 100;
+/// The most addresses one [`passwords`] or [`store_passwords`] takes: a
+/// composer's recipients, not an address book.
+pub const MAX_ADDRESSES: usize = 100;
 /// TS `ContactAddressType.OTHER`, what `createNewContact` files an address as.
 const CONTACT_ADDRESS_OTHER: i64 = 2;
 
-/// Passwords by recipient address, as a request's `passwords` object.
+/// Passwords by recipient address (the protocol's `passwords` object).
+/// Addresses match ignoring case and surrounding space; passwords are
+/// trimmed, and a blank one counts as missing.
 #[derive(Default)]
-pub(crate) struct Passwords(Vec<(String, Zeroizing<String>)>);
+pub struct Passwords(Vec<(String, Zeroizing<String>)>);
 
 impl fmt::Debug for Passwords {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,15 +71,38 @@ impl<'de> Deserialize<'de> for Passwords {
 }
 
 impl Passwords {
+    /// No passwords.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `address`'s password. The string is moved in and zeroed on drop.
+    pub fn insert(&mut self, address: impl Into<String>, password: SecretString) {
+        self.0.push((
+            address.into(),
+            Zeroizing::new(password.expose_secret().to_string()),
+        ));
+    }
+
     /// The password for `address`, trimmed as the official client trims it
     /// before use; None when there is none or it is blank. Addresses match
     /// ignoring case and surrounding space.
-    pub(crate) fn get(&self, address: &str) -> Option<&str> {
+    pub fn get(&self, address: &str) -> Option<&str> {
         self.0
             .iter()
             .find(|(key, _)| same_address(key, address))
             .map(|(_, password)| password.trim())
             .filter(|password| !password.is_empty())
+    }
+
+    /// Every address given, blank passwords included.
+    pub fn addresses(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.0.iter().map(|(address, _)| address.as_str())
+    }
+
+    /// Whether no address has a non-blank password.
+    pub fn is_empty(&self) -> bool {
+        self.entries().next().is_none()
     }
 
     fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -107,9 +136,9 @@ fn stored_password(contact: &Contact) -> Option<&str> {
         .filter(|password| !password.is_empty())
 }
 
-fn transport_or(error: &ApiCallError, code: &'static str) -> &'static str {
+fn transport_or(error: &ApiCallError, code: Error) -> Error {
     match error {
-        ApiCallError::RestClient { .. } => "transport_failed",
+        ApiCallError::RestClient { .. } => Error::TransportFailed,
         _ => code,
     }
 }
@@ -120,7 +149,7 @@ async fn load_contacts(sdk: &LoggedInSdk) -> Result<Vec<Contact>> {
         .await
         .map_err(|error| {
             diag::failed("contact load", &error);
-            transport_or(&error, "request_failed")
+            transport_or(&error, Error::RequestFailed)
         })
 }
 
@@ -205,7 +234,7 @@ fn new_contact(address: &str, name: &str, password: &str) -> Contact {
 
 /// One password to keep on a contact: the address, the recipient's name for
 /// a new contact, the password.
-struct ContactPassword<'a> {
+struct PasswordWrite<'a> {
     address: &'a str,
     name: &'a str,
     password: &'a str,
@@ -235,7 +264,7 @@ fn contact_write(contacts: &[Contact], address: &str, password: &str) -> Contact
 /// Keep each password on the recipient's contact: update one that holds a
 /// different password, create one where the address has none. Every write
 /// is attempted; the first failure's code comes back.
-async fn save(sdk: &LoggedInSdk, entries: &[ContactPassword<'_>]) -> Result<()> {
+async fn save(sdk: &LoggedInSdk, entries: &[PasswordWrite<'_>]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -250,7 +279,7 @@ async fn save(sdk: &LoggedInSdk, entries: &[ContactPassword<'_>]) -> Result<()> 
                 .await
                 .map_err(|error| {
                     diag::failed("contact password (Contact patch)", &error);
-                    transport_or(&error, "contact_save_failed")
+                    transport_or(&error, Error::ContactSaveFailed)
                 }),
             ContactWrite::Create => sdk
                 .contact_facade
@@ -259,7 +288,7 @@ async fn save(sdk: &LoggedInSdk, entries: &[ContactPassword<'_>]) -> Result<()> 
                 .map(|_| ())
                 .map_err(|error| {
                     diag::failed("contact create", &error);
-                    transport_or(&error, "contact_save_failed")
+                    transport_or(&error, Error::ContactSaveFailed)
                 }),
         };
         if outcome.is_ok() {
@@ -278,10 +307,10 @@ pub(crate) async fn save_for_sent(
     passwords: &Passwords,
     recipients: &[(&str, &str)],
 ) -> Result<()> {
-    let entries: Vec<ContactPassword> = sent_to
+    let entries: Vec<PasswordWrite> = sent_to
         .iter()
         .filter_map(|address| {
-            Some(ContactPassword {
+            Some(PasswordWrite {
                 address,
                 name: recipients
                     .iter()
@@ -296,9 +325,9 @@ pub(crate) async fn save_for_sent(
 
 /// Keep every non-blank password on its address's contact, without sending.
 pub(crate) async fn save_all(sdk: &LoggedInSdk, passwords: &Passwords) -> Result<()> {
-    let entries: Vec<ContactPassword> = passwords
+    let entries: Vec<PasswordWrite> = passwords
         .entries()
-        .map(|(address, password)| ContactPassword {
+        .map(|(address, password)| PasswordWrite {
             address,
             name: "",
             password,
@@ -310,17 +339,43 @@ pub(crate) async fn save_all(sdk: &LoggedInSdk, passwords: &Passwords) -> Result
 /// One address as a composer needs it: whether it is outside Tuta (None when
 /// the lookup failed) and the password its contact keeps (None for a Tuta
 /// address or when none is kept).
-pub(crate) struct RecipientPassword {
-    pub(crate) address: String,
-    pub(crate) external: Option<bool>,
-    pub(crate) password: Option<Zeroizing<String>>,
+pub struct ContactPassword {
+    pub address: String,
+    pub external: Option<bool>,
+    pub password: Option<SecretString>,
 }
 
-/// `RecipientPassword` for each distinct address, in the given order.
-pub(crate) async fn recipient_passwords(
+impl fmt::Debug for ContactPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactPassword")
+            .field("external", &self.external)
+            .field("has_password", &self.password.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Serialize for ContactPassword {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Row<'a> {
+            address: &'a str,
+            external: Option<bool>,
+            password: Option<&'a str>,
+        }
+        Row {
+            address: &self.address,
+            external: self.external,
+            password: self.password.as_ref().map(|p| p.expose_secret()),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// `ContactPassword` for each distinct address, in the given order.
+async fn recipient_passwords(
     sdk: &LoggedInSdk,
     addresses: &[String],
-) -> Result<Vec<RecipientPassword>> {
+) -> Result<Vec<ContactPassword>> {
     let addresses = crate::delivery::unique_addresses(addresses);
     if addresses.is_empty() {
         return Ok(Vec::new());
@@ -334,7 +389,7 @@ fn passwords_of(
     addresses: Vec<String>,
     kinds: &[RecipientKind],
     contacts: &[Contact],
-) -> Vec<RecipientPassword> {
+) -> Vec<ContactPassword> {
     addresses
         .into_iter()
         .zip(kinds)
@@ -347,8 +402,8 @@ fn passwords_of(
             let password = (external != Some(false))
                 .then(|| contact_for(contacts, &address).and_then(stored_password))
                 .flatten()
-                .map(|password| Zeroizing::new(password.to_string()));
-            RecipientPassword {
+                .map(|password| SecretString::from(password.to_string()));
+            ContactPassword {
                 address,
                 external,
                 password,
@@ -357,73 +412,40 @@ fn passwords_of(
         .collect()
 }
 
-// ------------------------------------------------- JSON operations (front end)
-
-fn check_addresses<'a>(addresses: impl ExactSizeIterator<Item = &'a str>) -> Result<()> {
+/// The checks [`passwords`] and [`store_passwords`] make before any I/O: at
+/// most [`MAX_ADDRESSES`] ([`Error::InvalidBatch`]), each one an address
+/// ([`Error::InvalidRecipient`]).
+pub fn check_addresses<'a>(addresses: impl ExactSizeIterator<Item = &'a str>) -> Result<()> {
     if addresses.len() > MAX_ADDRESSES {
-        return Err("invalid_batch");
+        return Err(Error::InvalidBatch);
     }
     let mut addresses = addresses;
     if addresses.any(|address| !valid_address(address)) {
-        return Err("invalid_recipient");
+        return Err(Error::InvalidRecipient);
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ContactPasswords {
-    session: Session,
-    addresses: Vec<String>,
+/// Per distinct address, in request order: whether it is outside Tuta and
+/// the password its contact keeps, so a composer can fill passwords in.
+pub async fn passwords(session: &Session, addresses: &[String]) -> Result<Vec<ContactPassword>> {
+    check_addresses(addresses.iter().map(String::as_str))?;
+    recipient_passwords(&session.sdk, addresses).await
 }
 
-/// `contact_passwords`: `recipient_passwords` as `{"recipients": [...]}`.
-pub(crate) async fn contact_passwords(sdk: &Sdk, request: ContactPasswords) -> Result<Value> {
-    check_addresses(request.addresses.iter().map(String::as_str))?;
-    if request.addresses.is_empty() {
-        return Ok(json!({"recipients": []}));
-    }
-    let sdk = resume(sdk, request.session).await?;
-    let rows = recipient_passwords(&sdk, &request.addresses).await?;
-    Ok(json!({"recipients": rows.iter().map(row_json).collect::<Vec<_>>()}))
-}
-
-fn row_json(row: &RecipientPassword) -> Value {
-    json!({"address": row.address, "external": row.external,
-        "password": row.password.as_deref().map(String::as_str)})
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StoreContactPasswords {
-    session: Session,
-    passwords: Passwords,
-}
-
-/// `store_contact_passwords`: `save_all`, for a send that is queued rather
-/// than sent now. A blank password is skipped: it never clears one.
-pub(crate) async fn store_contact_passwords(
-    sdk: &Sdk,
-    request: StoreContactPasswords,
-) -> Result<Value> {
-    check_addresses(
-        request
-            .passwords
-            .0
-            .iter()
-            .map(|(address, _)| address.as_str()),
-    )?;
-    if request.passwords.entries().next().is_none() {
-        return Ok(json!({}));
-    }
-    let sdk = resume(sdk, request.session).await?;
-    save_all(&sdk, &request.passwords).await?;
-    Ok(json!({}))
+/// Keep every non-blank password on its address's contact without
+/// sending, for a send that is queued for later: a contact holding another
+/// password is updated, an address without a contact gets a new one. A
+/// blank password is skipped: it never clears one.
+pub async fn store_passwords(session: &Session, passwords: &Passwords) -> Result<()> {
+    check_addresses(passwords.addresses())?;
+    save_all(&session.sdk, passwords).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
     use tutasdk::IdTupleGenerated;
 
     fn passwords(json: &str) -> Passwords {
@@ -540,7 +562,7 @@ mod tests {
         let kinds = [
             RecipientKind::External,
             RecipientKind::Internal,
-            RecipientKind::Unknown("transport_failed"),
+            RecipientKind::Unknown(Error::TransportFailed),
             RecipientKind::External,
         ];
         let contacts = [
@@ -551,7 +573,7 @@ mod tests {
         ];
         let rows: Vec<Value> = passwords_of(addresses.to_vec(), &kinds, &contacts)
             .iter()
-            .map(row_json)
+            .map(|row| serde_json::to_value(row).unwrap())
             .collect();
         assert_eq!(
             rows,
@@ -569,9 +591,9 @@ mod tests {
         assert_eq!(check_addresses(["a@b.c"].into_iter()), Ok(()));
         assert_eq!(
             check_addresses(["a@b.c", "nope"].into_iter()),
-            Err("invalid_recipient")
+            Err(Error::InvalidRecipient)
         );
         let many = vec!["a@b.c"; MAX_ADDRESSES + 1];
-        assert_eq!(check_addresses(many.into_iter()), Err("invalid_batch"));
+        assert_eq!(check_addresses(many.into_iter()), Err(Error::InvalidBatch));
     }
 }

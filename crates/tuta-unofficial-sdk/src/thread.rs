@@ -15,7 +15,7 @@
 //! official client names as `previousMessageId`): mail between Tuta
 //! accounts carries no header block, so that is the only place it is.
 
-use crate::{aggregate_id, diag, id, Result};
+use crate::{diag, ids::id, send::aggregate_id, Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use crypto_primitives::{aes::InitializationVector, randomizer_facade::RandomizerFacade};
 use serde::Deserialize;
@@ -55,28 +55,39 @@ const ENTRY_LOADS_IN_FLIGHT: usize = 8;
 /// like a reply: Tuta keeps no separate mark for it.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Action {
+pub enum Action {
     Reply,
     ReplyAll,
     Forward,
 }
 
-/// A checked request's place in a conversation: the parent's Message-ID
-/// (bare, without angle brackets) and the conversation type to create the
-/// draft with. New mail has no parent and type NEW.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Thread {
+/// A checked place in a conversation: the parent's Message-ID (bare, without
+/// angle brackets) and the conversation type to create the draft with. New
+/// mail ([`Thread::default`]) has no parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Thread {
     pub(crate) parent: Option<String>,
     pub(crate) conversation_type: i64,
+}
+
+impl Default for Thread {
+    fn default() -> Self {
+        Thread {
+            parent: None,
+            conversation_type: CONVERSATION_NEW,
+        }
+    }
 }
 
 impl Thread {
     /// Check the optional `in_reply_to`, `references` and `action`. Every
     /// Message-ID must be well formed and within the caps: a malformed one
-    /// refuses the request rather than being dropped, so the caller learns
-    /// its input was wrong. So does an action with no Message-ID to apply it
-    /// to. A parent without an action is answered as a reply.
-    pub(crate) fn of(
+    /// refuses the request ([`Error::InvalidThread`]) rather than being
+    /// dropped, so the caller learns its input was wrong. So does an action
+    /// with no Message-ID to apply it to. A parent without an action is
+    /// answered as a reply. `references` only names the parent (its newest
+    /// id) when `in_reply_to` is absent: Tuta keeps no References of its own.
+    pub fn new(
         in_reply_to: Option<&str>,
         references: Option<&str>,
         action: Option<Action>,
@@ -90,7 +101,7 @@ impl Thread {
         let parent = replied.or_else(|| referenced.last().cloned());
         let conversation_type = match (&parent, action) {
             (None, None) => CONVERSATION_NEW,
-            (None, Some(_)) => return Err("invalid_thread"),
+            (None, Some(_)) => return Err(Error::InvalidThread),
             (Some(_), Some(Action::Forward)) => CONVERSATION_FORWARD,
             (Some(_), _) => CONVERSATION_REPLY,
         };
@@ -98,6 +109,11 @@ impl Thread {
             parent,
             conversation_type,
         })
+    }
+
+    /// The parent's bare Message-ID, None for new mail.
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
     }
 }
 
@@ -118,7 +134,7 @@ fn bare_message_id(value: &str) -> Result<String> {
     if well_formed {
         Ok(id.to_string())
     } else {
-        Err("invalid_thread")
+        Err(Error::InvalidThread)
     }
 }
 
@@ -131,14 +147,16 @@ fn reference_ids(value: &str) -> Result<Vec<String>> {
     let mut rest = value.trim_start();
     while !rest.is_empty() {
         let end = if rest.starts_with('<') {
-            rest.find('>').map(|end| end + 1).ok_or("invalid_thread")?
+            rest.find('>')
+                .map(|end| end + 1)
+                .ok_or(Error::InvalidThread)?
         } else {
             rest.find(|c: char| c.is_ascii_whitespace() || c == '<')
                 .unwrap_or(rest.len())
         };
         ids.push(bare_message_id(&rest[..end])?);
         if ids.len() > MAX_REFERENCES {
-            return Err("invalid_thread");
+            return Err(Error::InvalidThread);
         }
         rest = rest[end..].trim_start();
     }
@@ -356,7 +374,7 @@ mod tests {
         references: Option<&str>,
         action: Option<Action>,
     ) -> Result<Thread> {
-        Thread::of(in_reply_to, references, action)
+        Thread::new(in_reply_to, references, action)
     }
 
     #[test]
@@ -412,24 +430,24 @@ mod tests {
         ] {
             assert_eq!(
                 thread(Some(bad), None, None),
-                Err("invalid_thread"),
+                Err(Error::InvalidThread),
                 "{bad:?}"
             );
         }
         for bad in ["<a@x> <b c@x>", "<a@x", "<a@x> <>"] {
             assert_eq!(
                 thread(None, Some(bad), None),
-                Err("invalid_thread"),
+                Err(Error::InvalidThread),
                 "{bad:?}"
             );
         }
         assert_eq!(
             thread(None, None, Some(Action::Reply)),
-            Err("invalid_thread")
+            Err(Error::InvalidThread)
         );
         assert_eq!(
             thread(None, Some("  "), Some(Action::Forward)),
-            Err("invalid_thread")
+            Err(Error::InvalidThread)
         );
         let longest = "a".repeat(MAX_MESSAGE_ID_BYTES);
         assert!(thread(Some(&longest), None, None).is_ok());
@@ -447,7 +465,7 @@ mod tests {
             Some("99@x")
         );
         let more = ids(MAX_REFERENCES + 1).join(" ");
-        assert_eq!(thread(None, Some(&more), None), Err("invalid_thread"));
+        assert_eq!(thread(None, Some(&more), None), Err(Error::InvalidThread));
     }
 
     #[test]

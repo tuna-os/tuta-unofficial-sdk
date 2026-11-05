@@ -1,0 +1,23 @@
+[package]
+name = "tuta-helper"
+description = "JSON-over-stdio front end on tuta-unofficial-sdk, one request per process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "tuta-helper"
+path = "src/main.rs"
+
+[dependencies]
+tuta-unofficial-sdk = { path = "../tuta-unofficial-sdk" }
+base64 = "0.22"
+futures-core = "0.3"
+libc = "0.2"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

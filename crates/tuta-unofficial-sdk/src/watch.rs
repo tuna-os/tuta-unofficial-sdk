@@ -1,41 +1,42 @@
-//! `watch`: push notifications over Tuta's event bus, the one streaming
-//! operation.
+//! Push notifications over Tuta's event bus.
 //!
-//! Every other operation answers with exactly one line. `watch` instead
-//! holds the event bus websocket the official client holds
-//! (`app-kit/local-store/event/EventBusClient.ts`, here through
-//! tutabridge's `EventBusClient`) and writes one JSON line per change until
-//! its stdin closes, then exits without a further line. Each line carries
-//! `version`:
+//! [`Session::watch`] holds the event bus websocket the official client
+//! holds (`app-kit/local-store/event/EventBusClient.ts`, here through
+//! tutabridge's `EventBusClient`) and yields one [`WatchEvent`] per change:
 //!
-//! - `{"event":"ready"}` once the bus first connects;
-//! - `{"event":"mail_changed","folder":"<mail set id>"}` when mail in that
-//!   folder was added, removed or changed (read state, labels); `folder` is
-//!   `""` when the folder could not be told, meaning "resync everything";
-//! - `{"event":"folders_changed"}` when a folder or label was created,
-//!   renamed, moved or deleted;
-//! - `{"event":"reconnect"}` after the bus dropped and came back. Missed
-//!   batches are replayed by the server, but a caller should resync anyway.
-//! - a final `{"error":{"code":...}}` when the watch cannot go on (session
-//!   revoked, client outdated), after which the helper exits.
+//! - `Ready` once the bus first connects;
+//! - `MailChanged { folder }` when mail in that folder was added, removed or
+//!   changed (read state, labels); `folder` is empty when the folder could
+//!   not be told, meaning "resync everything";
+//! - `FoldersChanged` when a folder or label was created, renamed, moved or
+//!   deleted, before the `MailChanged` events of the same batch;
+//! - `Reconnect` after the bus dropped and came back. Missed batches are
+//!   replayed by the server, but a caller should resync anyway.
 //!
-//! The request must be one newline-terminated line with stdin left open.
-//! No per-operation timeout applies. Nothing about a mail beyond its folder
-//! is written.
-use super::{
-    diag, id, new_sdk, resume, Operation, QuietStdout, Request, Result, Session, TUTA_URL, VERSION,
+//! A final `Err` ends the stream when the watch cannot go on (session
+//! revoked, client outdated, the bus gave up). While the bus reconnects the
+//! session is checked over REST, so an expired session ends the watch
+//! instead of retrying forever. Nothing about a mail beyond its folder is
+//! reported.
+use crate::{
+    diag,
+    ids::id,
+    mailbox_ops::{is_label, load_mailbox},
+    Error, Result, Session,
 };
-use crate::mailbox_ops::{is_label, load_mailbox};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use futures_core::Stream;
+use serde::Serialize;
 use std::{
     collections::{BTreeSet, HashMap},
-    io::{self, Read, Write},
-    os::fd::AsFd,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tutabridge_tuta::{
     event_bus::{
         EntityUpdateBatch, EventBusClient, EventBusError, EventBusMessage, Operation as BusOp,
@@ -54,23 +55,24 @@ use tutasdk::{
     LoggedInSdk, TypeRef,
 };
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Watch {
-    pub session: Session,
-}
+/// How long closing a watch waits for the bus to shut down.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Events buffered between the bus and a slow reader.
+const EVENT_BUFFER: usize = 64;
 
-/// Just enough of a request to tell a watch from the rest without decoding
-/// a large one twice.
-#[derive(Deserialize)]
-struct Peek {
-    op: Option<String>,
-}
-
-/// Whether a newline-terminated first line asks for `watch`.
-pub(crate) fn is_watch(line: &[u8]) -> bool {
-    line.ends_with(b"\n")
-        && serde_json::from_slice::<Peek>(line).is_ok_and(|p| p.op.as_deref() == Some("watch"))
+/// One change the event bus reported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum WatchEvent {
+    /// The bus connected for the first time.
+    Ready,
+    /// The bus dropped and came back: resync.
+    Reconnect,
+    /// A folder or label was created, renamed, moved or deleted.
+    FoldersChanged,
+    /// Mail in `folder` arrived, left or changed; empty means "resync
+    /// everything".
+    MailChanged { folder: String },
 }
 
 fn type_id(type_ref: TypeRef) -> i64 {
@@ -84,13 +86,11 @@ enum Change {
     Mail(String),
 }
 
-impl Change {
-    fn line(&self) -> Value {
-        match self {
-            Change::Folders => json!({"version": VERSION, "event": "folders_changed"}),
-            Change::Mail(folder) => {
-                json!({"version": VERSION, "event": "mail_changed", "folder": folder})
-            }
+impl From<Change> for WatchEvent {
+    fn from(change: Change) -> Self {
+        match change {
+            Change::Folders => WatchEvent::FoldersChanged,
+            Change::Mail(folder) => WatchEvent::MailChanged { folder },
         }
     }
 }
@@ -201,7 +201,7 @@ async fn mail_sets(
             Err(error) => diag::failed("watch: inline mail", &error),
         }
     }
-    let mail_id = super::tuple(&format!(
+    let mail_id = crate::ids::tuple(&format!(
         "{}/{}",
         update.instance_list_id, update.instance_id
     ))
@@ -215,99 +215,112 @@ async fn mail_sets(
         .map(|mail| mail.sets)
 }
 
-/// Writes lines to the reply channel. A write failure means the reader is
-/// gone, which ends the watch like a closed stdin.
-struct Lines(Box<dyn Write + Send>);
-
-impl Lines {
-    fn emit(&mut self, line: &Value) -> bool {
-        writeln!(self.0, "{line}")
-            .and_then(|()| self.0.flush())
-            .is_ok()
-    }
-}
-
-/// The real stdout: the SDK prints progress to fd 1, which stays parked on
-/// /dev/null for the whole watch; lines go to the saved descriptor.
-fn reply_channel(quiet: Option<&QuietStdout>) -> Box<dyn Write + Send> {
-    match quiet.and_then(|q| q.saved.as_fd().try_clone_to_owned().ok()) {
-        Some(fd) => Box::new(std::fs::File::from(fd)),
-        None => Box::new(io::stdout()),
-    }
-}
-
-/// Fires once stdin reaches EOF (or fails): the caller's stop signal.
-fn stdin_closed() -> watch::Receiver<bool> {
-    let (tx, rx) = watch::channel(false);
-    std::thread::spawn(move || {
-        let mut buffer = [0u8; 256];
-        let mut stdin = io::stdin();
-        while matches!(stdin.read(&mut buffer), Ok(n) if n > 0) {}
-        let _ = tx.send(true);
-    });
-    rx
-}
-
 /// The code a bus that gave up reports.
-fn bus_error(error: &EventBusError) -> &'static str {
+fn bus_error(error: &EventBusError) -> Error {
     match error {
-        EventBusError::AuthenticationRejected(429) => "transport_failed",
-        EventBusError::AuthenticationRejected(_) => "session_revoked",
-        EventBusError::InvalidMessage(_) => "watch_failed",
-        EventBusError::Stopped => "watch_failed",
+        EventBusError::AuthenticationRejected(429) => Error::TransportFailed,
+        EventBusError::AuthenticationRejected(_) => Error::SessionRevoked,
+        EventBusError::InvalidMessage(_) => Error::WatchFailed,
+        EventBusError::Stopped => Error::WatchFailed,
     }
 }
 
 /// Whether a failed session check ends the watch: only a definite verdict
 /// on the session or client does; an outage just waits for the bus.
-fn fatal(code: &'static str) -> bool {
+fn fatal(code: Error) -> bool {
     matches!(
         code,
-        "session_revoked" | "client_outdated" | "session_invalid"
+        Error::SessionRevoked | Error::ClientOutdated | Error::SessionInvalid
     )
 }
 
-/// Serve a watch request (`line`, newline included). Writes the reply lines
-/// itself; returns when stdin closes or the watch fails.
-pub(crate) async fn serve(line: &[u8], quiet: Option<&QuietStdout>) {
-    let mut lines = Lines(reply_channel(quiet));
-    if let Err(code) = run(line, &mut lines).await {
-        lines.emit(&json!({"version": VERSION, "error": {"code": code}}));
+/// A running watch: a stream of [`WatchEvent`]s that ends after an `Err`.
+/// Dropping it stops the bus in the background; [`Watch::close`] stops it
+/// and waits for the websocket to close.
+pub struct Watch {
+    events: mpsc::Receiver<Result<WatchEvent>>,
+    stop: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Watch {
+    /// Stop watching and wait (a few seconds at most) for the bus to shut
+    /// down cleanly.
+    pub async fn close(mut self) {
+        let _ = self.stop.send(true);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
-async fn run(line: &[u8], lines: &mut Lines) -> Result<()> {
-    let request: Request = serde_json::from_slice(line).map_err(|_| "invalid_request")?;
-    if request.version != VERSION {
-        return Err("unsupported_version");
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
     }
-    let Operation::Watch(Watch { session }) = request.operation else {
-        return Err("invalid_request");
-    };
-    let (access_token, user_id) = (session.access_token.clone(), session.user_id.clone());
-    let mut stop = stdin_closed();
-    let sdk = new_sdk()?;
-    let logged_in = resume(&sdk, session).await?;
-    let mut folders = Folders::load(&logged_in).await?;
-    let model_version = |type_ref: TypeRef| {
-        logged_in
-            .type_model_provider
-            .resolve_client_type_ref(&type_ref)
-            .and_then(|model| u32::try_from(model.version).ok())
-            .ok_or("watch_failed")
-    };
+}
+
+impl Stream for Watch {
+    type Item = Result<WatchEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.events.poll_recv(cx)
+    }
+}
+
+impl Session {
+    /// Hold Tuta's event bus open and stream what changes. Missed batches
+    /// are replayed only while one watch runs: a new watch starts from the
+    /// present.
+    pub async fn watch(&self) -> Result<Watch> {
+        let sdk = self.sdk.clone();
+        let folders = Folders::load(&sdk).await?;
+        let model_version = |type_ref: TypeRef| {
+            sdk.type_model_provider
+                .resolve_client_type_ref(&type_ref)
+                .and_then(|model| u32::try_from(model.version).ok())
+                .ok_or(Error::WatchFailed)
+        };
+        let bus = Arc::new(EventBusClient::new(
+            self.base_url.clone(),
+            model_version(User::type_ref())?,
+            model_version(Mail::type_ref())?,
+            tutasdk::CLIENT_VERSION.to_string(),
+            String::new(),
+        ));
+        let (events_tx, events) = mpsc::channel(EVENT_BUFFER);
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(
+            sdk,
+            bus,
+            self.saved.access_token().to_string(),
+            self.saved.user_id().to_string(),
+            folders,
+            events_tx,
+            stop_rx,
+        ));
+        Ok(Watch {
+            events,
+            stop,
+            task: Some(task),
+        })
+    }
+}
+
+async fn run(
+    sdk: Arc<LoggedInSdk>,
+    bus: Arc<EventBusClient>,
+    access_token: String,
+    user_id: String,
+    mut folders: Folders,
+    events: mpsc::Sender<Result<WatchEvent>>,
+    mut stop: watch::Receiver<bool>,
+) {
     let types = Types {
         mail: type_id(Mail::type_ref()),
         mail_set: type_id(MailSet::type_ref()),
         entry: type_id(MailSetEntry::type_ref()),
     };
-    let bus = Arc::new(EventBusClient::new(
-        TUTA_URL.to_string(),
-        model_version(User::type_ref())?,
-        model_version(Mail::type_ref())?,
-        tutasdk::CLIENT_VERSION.to_string(),
-        String::new(),
-    ));
     let mut state = bus.state();
     let last_batch_ids = bus.last_batch_ids();
     let (tx, mut rx) = mpsc::channel(64);
@@ -317,8 +330,9 @@ async fn run(line: &[u8], lines: &mut Lines) -> Result<()> {
         tokio::spawn(async move { bus.run(access_token, user_id, tx, shutdown_rx).await })
     };
     let mut connected_once = false;
-    let outcome = loop {
+    let outcome: Result<()> = loop {
         tokio::select! {
+            // A stop, or the watch dropped.
             _ = stop.changed() => break Ok(()),
             changed = state.changed() => {
                 if changed.is_err() {
@@ -327,16 +341,20 @@ async fn run(line: &[u8], lines: &mut Lines) -> Result<()> {
                 let now = *state.borrow_and_update();
                 match now {
                     WsState::Connected => {
-                        let event = if connected_once { "reconnect" } else { "ready" };
+                        let event = if connected_once {
+                            WatchEvent::Reconnect
+                        } else {
+                            WatchEvent::Ready
+                        };
                         connected_once = true;
-                        if !lines.emit(&json!({"version": VERSION, "event": event})) {
+                        if events.send(Ok(event)).await.is_err() {
                             break Ok(());
                         }
                     }
                     // The bus retries an expired session forever; a REST
                     // call tells a dead session from a dead network.
                     WsState::Reconnecting => {
-                        if let Err(code) = load_mailbox(&logged_in).await {
+                        if let Err(code) = load_mailbox(&sdk).await {
                             if fatal(code) {
                                 break Err(code);
                             }
@@ -347,8 +365,15 @@ async fn run(line: &[u8], lines: &mut Lines) -> Result<()> {
             }
             message = rx.recv() => match message {
                 Some(EventBusMessage::EntityUpdate(batch)) => {
-                    let found = changes(&logged_in, &mut folders, &types, &batch).await;
-                    if !found.iter().all(|change| lines.emit(&change.line())) {
+                    let found = changes(&sdk, &mut folders, &types, &batch).await;
+                    let mut reader_gone = false;
+                    for change in found {
+                        if events.send(Ok(change.into())).await.is_err() {
+                            reader_gone = true;
+                            break;
+                        }
+                    }
+                    if reader_gone {
                         break Ok(());
                     }
                     // Processed: a reconnect resumes after this batch.
@@ -358,18 +383,21 @@ async fn run(line: &[u8], lines: &mut Lines) -> Result<()> {
                 }
                 Some(_) => {}
                 // The bus gave up; its result, read below, says why.
-                None => break Err("watch_failed"),
+                None => break Err(Error::WatchFailed),
             },
         }
     };
     let _ = shutdown_tx.send(true);
-    let finished = tokio::time::timeout(Duration::from_secs(5), runner).await;
-    match (outcome, finished) {
-        (Err("watch_failed"), Ok(Ok(Err(error)))) => {
+    let finished = tokio::time::timeout(SHUTDOWN_GRACE, runner).await;
+    let outcome = match (outcome, finished) {
+        (Err(Error::WatchFailed), Ok(Ok(Err(error)))) => {
             diag::failed("watch: event bus", &error);
             Err(bus_error(&error))
         }
         (outcome, _) => outcome,
+    };
+    if let Err(code) = outcome {
+        let _ = events.send(Err(code)).await;
     }
 }
 
@@ -378,27 +406,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_newline_terminated_watch_line_streams() {
-        assert!(is_watch(
-            b"{\"version\":1,\"op\":\"watch\",\"session\":{}}\n"
-        ));
-        assert!(!is_watch(
-            b"{\"version\":1,\"op\":\"watch\",\"session\":{}}"
-        ));
-        assert!(!is_watch(b"{\"version\":1,\"op\":\"sync\"}\n"));
-        assert!(!is_watch(b"{\"version\":1,\n"));
-        assert!(!is_watch(b"\n"));
-    }
-
-    #[test]
-    fn change_lines_carry_version_and_folder() {
+    fn changes_become_events_folders_first() {
         assert_eq!(
-            Change::Mail("a/b".into()).line(),
-            json!({"version": 1, "event": "mail_changed", "folder": "a/b"})
+            WatchEvent::from(Change::Mail("a/b".into())),
+            WatchEvent::MailChanged {
+                folder: "a/b".into()
+            }
         );
         assert_eq!(
-            Change::Folders.line(),
-            json!({"version": 1, "event": "folders_changed"})
+            serde_json::to_value(WatchEvent::from(Change::Mail("a/b".into()))).unwrap(),
+            serde_json::json!({"event": "mail_changed", "folder": "a/b"})
+        );
+        assert_eq!(
+            serde_json::to_value(WatchEvent::from(Change::Folders)).unwrap(),
+            serde_json::json!({"event": "folders_changed"})
+        );
+        assert_eq!(
+            serde_json::to_value(WatchEvent::Ready).unwrap(),
+            serde_json::json!({"event": "ready"})
         );
         // Folder changes sort first, so a caller refreshes its tree before
         // syncing the folders named after it.
@@ -412,17 +437,17 @@ mod tests {
     fn bus_failures_map_to_fixed_codes() {
         assert_eq!(
             bus_error(&EventBusError::AuthenticationRejected(401)),
-            "session_revoked"
+            Error::SessionRevoked
         );
         assert_eq!(
             bus_error(&EventBusError::AuthenticationRejected(472)),
-            "session_revoked"
+            Error::SessionRevoked
         );
         assert_eq!(
             bus_error(&EventBusError::AuthenticationRejected(429)),
-            "transport_failed"
+            Error::TransportFailed
         );
-        assert!(fatal("session_revoked") && !fatal("transport_failed"));
+        assert!(fatal(Error::SessionRevoked) && !fatal(Error::TransportFailed));
     }
 
     #[test]
@@ -430,5 +455,18 @@ mod tests {
         assert_eq!(type_id(Mail::type_ref()), 97);
         assert_eq!(type_id(MailSet::type_ref()), 429);
         assert_eq!(type_id(MailSetEntry::type_ref()), 1450);
+    }
+
+    #[test]
+    fn mail_folders_leave_labels_out() {
+        let folders = Folders {
+            by_entries: HashMap::new(),
+            labels: ["l/1".to_string()].into_iter().collect(),
+        };
+        let sets = [
+            crate::ids::tuple("f/1").unwrap(),
+            crate::ids::tuple("l/1").unwrap(),
+        ];
+        assert_eq!(mail_folders(&sets, &folders), ["f/1"]);
     }
 }
