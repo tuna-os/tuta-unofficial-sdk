@@ -205,10 +205,10 @@ fn new_contact(address: &str, name: &str, password: &str) -> Contact {
 
 /// One password to keep on a contact: the address, the recipient's name for
 /// a new contact, the password.
-pub(crate) struct ContactPassword<'a> {
-    pub(crate) address: &'a str,
-    pub(crate) name: &'a str,
-    pub(crate) password: &'a str,
+struct ContactPassword<'a> {
+    address: &'a str,
+    name: &'a str,
+    password: &'a str,
 }
 
 /// What `save` does for one address, given the contacts there are.
@@ -235,7 +235,7 @@ fn contact_write(contacts: &[Contact], address: &str, password: &str) -> Contact
 /// Keep each password on the recipient's contact: update one that holds a
 /// different password, create one where the address has none. Every write
 /// is attempted; the first failure's code comes back.
-pub(crate) async fn save(sdk: &LoggedInSdk, entries: &[ContactPassword<'_>]) -> Result<()> {
+async fn save(sdk: &LoggedInSdk, entries: &[ContactPassword<'_>]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -269,6 +269,96 @@ pub(crate) async fn save(sdk: &LoggedInSdk, entries: &[ContactPassword<'_>]) -> 
     outcome
 }
 
+/// Keep the password of every recipient a send reached password-protected
+/// (`sent_to`), the way `save` does; `recipients` pairs each address of the
+/// mail with its display name, which names a new contact.
+pub(crate) async fn save_for_sent(
+    sdk: &LoggedInSdk,
+    sent_to: &[String],
+    passwords: &Passwords,
+    recipients: &[(&str, &str)],
+) -> Result<()> {
+    let entries: Vec<ContactPassword> = sent_to
+        .iter()
+        .filter_map(|address| {
+            Some(ContactPassword {
+                address,
+                name: recipients
+                    .iter()
+                    .find(|(candidate, _)| same_address(candidate, address))
+                    .map_or("", |(_, name)| name),
+                password: passwords.get(address)?,
+            })
+        })
+        .collect();
+    save(sdk, &entries).await
+}
+
+/// Keep every non-blank password on its address's contact, without sending.
+pub(crate) async fn save_all(sdk: &LoggedInSdk, passwords: &Passwords) -> Result<()> {
+    let entries: Vec<ContactPassword> = passwords
+        .entries()
+        .map(|(address, password)| ContactPassword {
+            address,
+            name: "",
+            password,
+        })
+        .collect();
+    save(sdk, &entries).await
+}
+
+/// One address as a composer needs it: whether it is outside Tuta (None when
+/// the lookup failed) and the password its contact keeps (None for a Tuta
+/// address or when none is kept).
+pub(crate) struct RecipientPassword {
+    pub(crate) address: String,
+    pub(crate) external: Option<bool>,
+    pub(crate) password: Option<Zeroizing<String>>,
+}
+
+/// `RecipientPassword` for each distinct address, in the given order.
+pub(crate) async fn recipient_passwords(
+    sdk: &LoggedInSdk,
+    addresses: &[String],
+) -> Result<Vec<RecipientPassword>> {
+    let addresses = crate::delivery::unique_addresses(addresses);
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kinds = classify_recipients(sdk, &addresses).await;
+    let contacts = load_contacts(sdk).await?;
+    Ok(passwords_of(addresses, &kinds, &contacts))
+}
+
+fn passwords_of(
+    addresses: Vec<String>,
+    kinds: &[RecipientKind],
+    contacts: &[Contact],
+) -> Vec<RecipientPassword> {
+    addresses
+        .into_iter()
+        .zip(kinds)
+        .map(|(address, kind)| {
+            let external = match kind {
+                RecipientKind::Internal => Some(false),
+                RecipientKind::External => Some(true),
+                RecipientKind::Unknown(_) => None,
+            };
+            let password = (external != Some(false))
+                .then(|| contact_for(contacts, &address).and_then(stored_password))
+                .flatten()
+                .map(|password| Zeroizing::new(password.to_string()));
+            RecipientPassword {
+                address,
+                external,
+                password,
+            }
+        })
+        .collect()
+}
+
+// ------------------------------------------------- JSON operations (front end)
+
 fn check_addresses<'a>(addresses: impl ExactSizeIterator<Item = &'a str>) -> Result<()> {
     if addresses.len() > MAX_ADDRESSES {
         return Err("invalid_batch");
@@ -287,41 +377,20 @@ pub(crate) struct ContactPasswords {
     addresses: Vec<String>,
 }
 
-/// Each address once, in request order: whether it is outside Tuta (null
-/// when the lookup failed) and the password its contact keeps (null for a
-/// Tuta address or when none is kept), so a composer can fill it in.
+/// `contact_passwords`: `recipient_passwords` as `{"recipients": [...]}`.
 pub(crate) async fn contact_passwords(sdk: &Sdk, request: ContactPasswords) -> Result<Value> {
     check_addresses(request.addresses.iter().map(String::as_str))?;
-    let addresses = crate::delivery::unique_addresses(&request.addresses);
-    if addresses.is_empty() {
+    if request.addresses.is_empty() {
         return Ok(json!({"recipients": []}));
     }
     let sdk = resume(sdk, request.session).await?;
-    let kinds = classify_recipients(&sdk, &addresses).await;
-    let contacts = load_contacts(&sdk).await?;
-    Ok(json!({"recipients": recipient_rows(&addresses, &kinds, &contacts)}))
+    let rows = recipient_passwords(&sdk, &request.addresses).await?;
+    Ok(json!({"recipients": rows.iter().map(row_json).collect::<Vec<_>>()}))
 }
 
-fn recipient_rows(
-    addresses: &[String],
-    kinds: &[RecipientKind],
-    contacts: &[Contact],
-) -> Vec<Value> {
-    addresses
-        .iter()
-        .zip(kinds)
-        .map(|(address, kind)| {
-            let external = match kind {
-                RecipientKind::Internal => Some(false),
-                RecipientKind::External => Some(true),
-                RecipientKind::Unknown(_) => None,
-            };
-            let password = (external != Some(false))
-                .then(|| contact_for(contacts, address).and_then(stored_password))
-                .flatten();
-            json!({"address": address, "external": external, "password": password})
-        })
-        .collect()
+fn row_json(row: &RecipientPassword) -> Value {
+    json!({"address": row.address, "external": row.external,
+        "password": row.password.as_deref().map(String::as_str)})
 }
 
 #[derive(Deserialize)]
@@ -331,8 +400,8 @@ pub(crate) struct StoreContactPasswords {
     passwords: Passwords,
 }
 
-/// Keep passwords on contacts without sending, for a send that is queued
-/// rather than sent now. A blank password is skipped: it never clears one.
+/// `store_contact_passwords`: `save_all`, for a send that is queued rather
+/// than sent now. A blank password is skipped: it never clears one.
 pub(crate) async fn store_contact_passwords(
     sdk: &Sdk,
     request: StoreContactPasswords,
@@ -344,20 +413,11 @@ pub(crate) async fn store_contact_passwords(
             .iter()
             .map(|(address, _)| address.as_str()),
     )?;
-    let entries: Vec<ContactPassword> = request
-        .passwords
-        .entries()
-        .map(|(address, password)| ContactPassword {
-            address,
-            name: "",
-            password,
-        })
-        .collect();
-    if entries.is_empty() {
+    if request.passwords.entries().next().is_none() {
         return Ok(json!({}));
     }
     let sdk = resume(sdk, request.session).await?;
-    save(&sdk, &entries).await?;
+    save_all(&sdk, &request.passwords).await?;
     Ok(json!({}))
 }
 
@@ -489,7 +549,10 @@ mod tests {
             contact(&["unknown@example.org"], Some("pw3")),
             contact(&["none@example.org"], Some("")),
         ];
-        let rows = recipient_rows(&addresses, &kinds, &contacts);
+        let rows: Vec<Value> = passwords_of(addresses.to_vec(), &kinds, &contacts)
+            .iter()
+            .map(row_json)
+            .collect();
         assert_eq!(
             rows,
             [

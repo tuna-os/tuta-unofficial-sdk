@@ -1250,9 +1250,18 @@ async fn send(
     };
     // The mail went out; nothing below may fail the send.
     let marked = thread::mark_parent(&sdk, &mail, &thread).await;
-    let named: Vec<&SendRecipient> = to.iter().chain(&cc).chain(&bcc).collect();
+    // Each password-protected recipient's password stays on their contact,
+    // as the official client's `SendMailModel.updateContacts` keeps it.
+    let named: Vec<(&str, &str)> = to
+        .iter()
+        .chain(&cc)
+        .chain(&bcc)
+        .map(|r| (r.address.as_str(), r.name.as_str()))
+        .collect();
     let contacts_saved =
-        save_sent_passwords(&sdk, &delivered.secure_external, &passwords, &named).await;
+        secure_external::save_for_sent(&sdk, &delivered.secure_external, &passwords, &named)
+            .await
+            .is_ok();
     let mut result = with_parent_mark(
         sent_reply(reply.as_ref(), counts, Some(&delivered)),
         &thread,
@@ -1260,33 +1269,6 @@ async fn send(
     );
     result["contacts_saved"] = json!(contacts_saved);
     Ok(result)
-}
-
-/// Keep each password-protected recipient's password on their contact, as
-/// the official client's `SendMailModel.updateContacts` does, so Tuta's own
-/// apps offer it next time: a new contact (named from the recipient) where
-/// the address has none, an update where the contact holds another password.
-/// Whether every write went through; a failure never fails the sent mail.
-async fn save_sent_passwords(
-    sdk: &LoggedInSdk,
-    external: &[String],
-    passwords: &secure_external::Passwords,
-    named: &[&SendRecipient],
-) -> bool {
-    let entries: Vec<secure_external::ContactPassword> = external
-        .iter()
-        .filter_map(|address| {
-            Some(secure_external::ContactPassword {
-                address,
-                name: named
-                    .iter()
-                    .find(|r| r.address.eq_ignore_ascii_case(address))
-                    .map_or("", |r| r.name.as_str()),
-                password: passwords.get(address)?,
-            })
-        })
-        .collect();
-    secure_external::save(sdk, &entries).await.is_ok()
 }
 
 /// Each attachment file's session key, resolved from the server like the
