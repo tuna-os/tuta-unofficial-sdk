@@ -1,21 +1,23 @@
 #!/bin/sh
-# Prepare the Tuta SDK the helper builds against, in native/tuta/prepared/.
-# Run it wherever sdk-prepare.py used to be run; a repeat run is a quick no-op.
+# Prepare the Tuta SDK this workspace builds against, in prepared/. Run it
+# after `git submodule update --init --recursive`; a repeat run is a quick
+# no-op.
 #
 # 1. TutaBridge's upstream/scripts/sdk-prepare.py prepares and verifies its
 #    pinned SDK in upstream/sdk/generated, which stays untouched.
-# 2. prepared/ gets a copy of that SDK with Hylki's own patches from
+# 2. prepared/ gets a copy of that SDK with this repository's patches from
 #    sdk-patches/ applied in name order, beside a copy of TutaBridge's
-#    tutabridge-tuta crate. Cargo.toml builds both from there.
+#    tutabridge-tuta crate. crates/tuta-unofficial-sdk builds both from
+#    there.
 #
 # Why a copy: tutabridge-tuta's build script refuses an SDK whose content
 # differs from sdk/EXPECTED, so patching upstream/sdk/generated in place would
 # break the build. prepared/ mirrors the layout the build script checks --
-# crates/tuta next to sdk/{BASE,EXPECTED,patches,generated} -- with Hylki's
-# patches listed (as hylki-<name>) and EXPECTED's content digest recomputed
-# over the patched tree, so the check still pins exactly what is built.
-# EXPECTED's tree= stays TutaBridge's: the git tree the patched SDK starts
-# from.
+# crates/tuta next to sdk/{BASE,EXPECTED,patches,generated} -- with our
+# patches listed (as unofficial-<name>) and EXPECTED's content digest
+# recomputed over the patched tree, so the check still pins exactly what is
+# built. EXPECTED's tree= stays TutaBridge's: the git tree the patched SDK
+# starts from.
 #
 # Unchanged files keep their mtimes, so a repeat run does not make Cargo
 # rebuild the SDK; changed ones are written with the current time.
@@ -57,9 +59,10 @@ def regular_patches(folder):
 
 
 def git_apply(patch, tree, ceiling):
-    # The ceiling keeps git from treating Hylki's own repository above the
-    # copy as the work tree; callers' repository variables go for the same
-    # reason, and so do user and system config.
+    # The ceiling keeps git from treating the repository above the copy
+    # (this one, or one that vendors it) as the work tree; callers'
+    # repository variables go for the same reason, and so do user and
+    # system config.
     env = {k: v for k, v in os.environ.items()
            if k not in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
                         'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS')}
@@ -110,7 +113,7 @@ try:
     for patch in regular_patches(upstream / 'sdk/patches'):
         shutil.copyfile(patch, stage / 'sdk/patches' / patch.name)
     for patch in ours:
-        shutil.copyfile(patch, stage / 'sdk/patches' / f'hylki-{patch.name}')
+        shutil.copyfile(patch, stage / 'sdk/patches' / f'unofficial-{patch.name}')
     shutil.copyfile(upstream / 'sdk/BASE', stage / 'sdk/BASE')
     expected['content'] = sdk.content_digest(generated)
     expected['patches'] = sorted(
@@ -126,5 +129,5 @@ finally:
 
 if sdk.content_digest(out / 'sdk/generated') != expected['content']:
     fail('prepared/ differs from what was just written; is another prepare.sh running?')
-print(f'Hylki SDK prepared in {out.relative_to(here)} with {len(ours)} patch(es)')
+print(f'Tuta SDK prepared in {out.relative_to(here)} with {len(ours)} patch(es)')
 PY
