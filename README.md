@@ -1,85 +1,249 @@
-# hylki-tuta
+# tuta-unofficial-sdk
 
-`hylki-tuta` is the helper program Hylki uses for Tuta accounts. Tuta offers
-no IMAP, SMTP or JMAP: mail is end-to-end encrypted on the server, and only
-Tuta's own client library can sign in and decrypt it. The helper links that
-library, so Hylki can read and send Tuta mail without running a bridge.
+An unofficial, community-maintained Tuta (Tutanota) SDK for Rust: sign in,
+read and decrypt mail, send it end-to-end encrypted (to Tuta recipients by
+key, to everyone else behind a password), keep drafts, manage folders and
+labels, import mail, keep contact passwords and watch the event bus for
+changes. Tuta offers no IMAP, SMTP or JMAP: mail is end-to-end encrypted on
+the server, and only Tuta's own client library can sign in and decrypt it.
+This SDK wraps that library in a typed async API, and ships `tuta-helper`, a
+small JSON-over-stdio program on top of it for applications that would
+rather run a separate process.
 
-Hylki starts the helper once per operation, writes one request to its stdin,
-reads one reply from its stdout, and waits for it to exit; only `watch`, which
-holds Tuta's push channel open, streams one line per change instead. The
-helper does not listen on a socket, keep a local cache, or speak any mail
-protocol. Decrypted mail goes back to Hylki as headers, a body and
-attachments, which Hylki turns into a MIME message for its usual reader.
+## Status and disclaimer
 
-## Sources
+**This project is not affiliated with, endorsed by or supported by Tuta GmbH.**
+"Tuta" and "Tutanota" are their trademarks, used here only to say what this
+software talks to.
+
+Tuta's API is undocumented and third-party clients are unsupported. Using this
+SDK may conflict with Tuta's terms of service: read them and decide for
+yourself before you use it with an account, and prefer a test account while
+developing. The server can change or refuse this client at any time; a pinned
+SDK that falls behind the minimum client version Tuta accepts fails with
+`client_outdated`, and the fix is to update the pin, never to report a
+different client version.
+
+Version 0.1.0 is the first release: the API follows the needs of its first
+user, the Hylki mail client's Tuta support, and may still change.
+
+## Features
+
+- Sign-in with password and TOTP; saved, resumable sessions; closing a
+  session on the server.
+- The folder tree and labels; folder pages with every mail's labels and
+  Message-ID; a mail decrypted to its parts or to RFC 5322 MIME.
+- Read state, moves (with the server's own undo information), labels,
+  permanent deletes from Trash and Spam, emptying Trash and Spam.
+- Folders and labels: create, rename, re-parent, recolour, delete, with the
+  official client's rules.
+- Drafts: save (create or replace) and discard, with their place in a
+  conversation.
+- Sending: confidential (end-to-end encrypted) to Tuta recipients by their
+  public keys and to everyone else behind a password, or ordinary with
+  explicit consent; replies and forwards threaded and marked on the parent;
+  attachments; a definite or uncertain outcome read from the wire.
+- Contact passwords for password-protected recipients, read and stored the
+  way Tuta's own apps keep them.
+- Import of a MIME message into a folder, as the official desktop importer
+  does (Legend and Unlimited plans).
+- Push: a stream of folder and mail changes from Tuta's event bus.
+
+## Security model
+
+**All cryptography is the Tuta SDK's.** The SDK is Tuta's own Rust library
+(`tuta-sdk` from [tutanota](https://github.com/tutao/tutanota)), at the
+release and commit [tutabridge](https://github.com/spartanz51/tutabridge)
+pins, with tutabridge's patches. This repository adds no cipher, key
+derivation or key exchange of its own: it composes the official client's
+service requests on top of the SDK, wraps symmetric keys only with the SDK's
+own AES functions, and exposes a few SDK internals through four small
+patches:
+
+- `01-recipient-key-data.patch` exposes
+  `LoggedInSdk::encrypt_bucket_key_for_internal_recipients`, which loads
+  each Tuta recipient's current public key and encrypts a mail's bucket key
+  for it through the SDK's own `AsymmetricCryptoFacade` (RSA, or TutaCrypt
+  with the sender identity key), as the official client's
+  `encryptBucketKeyForInternalRecipient` does. It adds no cryptography.
+- `02-service-response-session-key.patch` decrypts a service response
+  whose type has no owner key of its own (a created folder, an updated
+  draft) with the request's session key, as the official client's
+  `ServiceExecutor.decryptResponse` does, instead of failing after the
+  server already applied the request.
+- `03-entity-patch.patch` adds `CryptoEntityClient::patch_instance`, which
+  PATCHes a `sys/PatchList` naming only the changed attributes, as the
+  official client's `EntityRestClient.update` writes every update. The
+  SDK's own whole-instance PUT would encrypt every value again, final ones
+  such as a mail's subject included. It adds `PATCH` to the SDK's
+  `HttpMethod` for it.
+- `04-secure-external-recipient.patch` exposes
+  `LoggedInSdk::secure_external_recipient_key_data`, a port of the official
+  client's password-protected recipient path (`addRecipientKeyData`,
+  `getExternalGroupKeys`, `createExternalUser`): an Argon2id key from the
+  password, the external user found or created, the bucket key wrapped for
+  it. It refuses a shared-mailbox or external sender, as the official
+  client does. `ContactFacade` gains `create_contact` and
+  `set_preshared_password`, and `EntityClient::create_instance` reports a
+  refused create as an error instead of panicking. It adds no
+  cryptography.
+
+Secrets stay secrets: passwords, session tokens and wrapped keys are held in
+`secrecy`/`zeroize` types with no `Debug` form, never go in argv or the
+environment of the helper, and never reach the diagnostics, which redact
+addresses, ids, tokens and key bytes. A send never falls back to SMTP and
+never quietly drops encryption. Recipient keys are not verified (see
+[Delivery](#delivery)); each one's version and fingerprint is reported so a
+caller can pin them.
+
+### Sources
 
 The `upstream` submodule is used for source only:
 
 - [tutabridge](https://github.com/spartanz51/tutabridge) at
   `da12fd4a479d6885f6643f05690b78205e2adbec` supplies its `tutabridge-tuta`
-  mail extensions and the SDK preparation script. Its IMAP/SMTP server is not
-  linked or run.
+  mail extensions (mail details, attachments, the event bus client) and the
+  SDK preparation script. Its IMAP/SMTP server is not linked or run.
 - The [Tuta SDK](https://github.com/tutao/tutanota) is Tuta release
-  `362.261020.0`, commit `f5e2d8628f17be558fe63130396ff625bbe69c77`, with
-  tutabridge's twelve patches for optional encrypted values, address
-  normalization, account KDFs, batched entity loads, blobs, interactive
-  sessions, owner keys, AEAD reads and bucket keys (series and hashes in
-  `upstream/sdk/EXPECTED`), plus Hylki's own patches in `sdk-patches/`:
-  - `01-recipient-key-data.patch` exposes
-    `LoggedInSdk::encrypt_bucket_key_for_internal_recipients`, which loads
-    each Tuta recipient's current public key and encrypts a mail's bucket key
-    for it through the SDK's own `AsymmetricCryptoFacade` (RSA, or TutaCrypt
-    with the sender identity key), as the official client's
-    `encryptBucketKeyForInternalRecipient` does. It adds no cryptography.
-  - `02-service-response-session-key.patch` decrypts a service response
-    whose type has no owner key of its own (a created folder, an updated
-    draft) with the request's session key, as the official client's
-    `ServiceExecutor.decryptResponse` does, instead of failing after the
-    server already applied the request.
-  - `03-entity-patch.patch` adds `CryptoEntityClient::patch_instance`, which
-    PATCHes a `sys/PatchList` naming only the changed attributes, as the
-    official client's `EntityRestClient.update` writes every update. The
-    SDK's own whole-instance PUT would encrypt every value again, final ones
-    such as a mail's subject included. It adds `PATCH` to the SDK's
-    `HttpMethod` for it.
-  - `04-secure-external-recipient.patch` exposes
-    `LoggedInSdk::secure_external_recipient_key_data`, a port of the official
-    client's password-protected recipient path (`addRecipientKeyData`,
-    `getExternalGroupKeys`, `createExternalUser`): an Argon2id key from the
-    password, the external user found or created, the bucket key wrapped for
-    it. It refuses a shared-mailbox or external sender, as the official
-    client does. `ContactFacade` gains `create_contact` and
-    `set_preshared_password`, and `EntityClient::create_instance` reports a
-    refused create as an error instead of panicking. It adds no
-    cryptography.
+  `362.261020.0`, commit `f5e2d8628f17be558fe63130396ff625bbe69c77` (the
+  `upstream/tuta-repo` submodule), with tutabridge's twelve patches for
+  optional encrypted values, address normalization, account KDFs, batched
+  entity loads, blobs, interactive sessions, owner keys, AEAD reads and
+  bucket keys (series and hashes in `upstream/sdk/EXPECTED`), plus ours in
+  `sdk-patches/`.
 
-  `prepare.sh` runs tutabridge's `sdk-prepare.py`, which prepares and
-  verifies the pinned SDK in `upstream/sdk/generated`, then writes a copy with
-  Hylki's patches applied to `prepared/`, beside a copy of `tutabridge-tuta`.
-  That crate's build script verifies the SDK it builds against, so
-  `prepared/sdk/EXPECTED` lists both patch series (Hylki's as
-  `hylki-<name>`) and the content digest of the patched tree; the build
-  verifies exactly what it compiles. The crate builds only from `prepared/`.
+`prepare.sh` runs tutabridge's `sdk-prepare.py`, which prepares and verifies
+the pinned SDK in `upstream/sdk/generated`, then writes a copy with our
+patches applied to `prepared/`, beside a copy of `tutabridge-tuta`. That
+crate's build script verifies the SDK it builds against, so
+`prepared/sdk/EXPECTED` lists both patch series (ours as
+`unofficial-<name>`) and the content digest of the patched tree; the build
+verifies exactly what it compiles. The library builds only from `prepared/`.
 
-Both are GPL-3.0-or-later, and so is this helper. It runs as a separate
-program from Hylki.
+## Layout
 
-Tuta's API is undocumented and third-party clients are unsupported. A pinned
-SDK can fall behind the minimum client version Tuta's servers accept; the
-helper then fails with `client_outdated`, and the fix is to update the SDK pin,
-never to report a different client version.
+| Path | What |
+| --- | --- |
+| `crates/tuta-unofficial-sdk` | The library. |
+| `crates/tuta-unofficial-sdk/examples/read_mail.rs` | A small CLI: list the folders, read the newest mail. |
+| `crates/tuta-helper` | The `tuta-helper` binary: the JSON protocol below, a thin front end on the library. |
+| `sdk-patches/` | Our patches to the Tuta SDK, applied in name order. |
+| `prepare.sh` | Prepares the patched SDK in `prepared/` (gitignored). |
+| `upstream/` | The tutabridge submodule, with tutanota inside it. |
+| `scripts/cargo-sources.sh` | Regenerates `cargo-sources.json` for Flatpak builds. |
 
-## Protocol
+## The library
+
+```rust
+use secrecy::SecretString;
+use tuta_unofficial_sdk::{Client, Page};
+
+async fn demo() -> tuta_unofficial_sdk::Result<()> {
+    let client = Client::new()?.client_name("my-app");
+    let password = SecretString::from("correct horse".to_string());
+    let session = client.login("ada@tuta.com", &password, Some("123456")).await?;
+    let saved = session.saved().clone(); // serialize it into a keyring
+
+    for folder in session.folders().await? {
+        println!("{} {:?} {}", folder.id, folder.role, folder.label);
+    }
+    let page = session.sync(None, Page::new(50, 0)?).await?; // the Inbox
+    if let Some(newest) = page.messages.first() {
+        let message = session.message(&newest.header.id).await?;
+        let mime: Vec<u8> = message.to_mime();
+        println!("{} bytes", mime.len());
+    }
+    Ok(())
+}
+```
+
+The API, all `async` on a tokio runtime:
+
+| Area | API |
+| --- | --- |
+| Sessions | `Client::new`, `Client::with_url`, `Client::client_name`, `Client::login(email, &SecretString, totp) -> Session`, `Session::resume(&client, SavedSession)`, `Session::saved`, `Session::revoke`, `Client::revoke(&SavedSession)` |
+| Reading | `Session::folders`, `labels`, `sync(Option<&Id>, Page) -> SyncPage`, `message(&Id) -> Message`, `Message::to_mime() -> Vec<u8>` |
+| Mail | `mark_read(&[Id], bool)`, `move_mail(&[Id], &Id)`, `delete(&[Id], &Id)`, `empty_folder(&Id)`, `apply_labels(&[Id], &LabelChanges)`; per-id `IdOutcome`/`MoveOutcome` rows |
+| Folders, labels | `create_folder(&Name, Option<&Id>)`, `rename_folder(&FolderEdit)`, `delete_folder(&Id) -> FolderDeletion`, `create_label(&Name, &Color)`, `update_label(&Id, &LabelEdit)`, `delete_label(&Id)` |
+| Sending | `send(SendRequest) -> SendOutcome`, `send_within(SendRequest, Duration)`; `Thread::new(in_reply_to, references, action)` |
+| Drafts | `drafts::save(&Session, &DraftRequest) -> Id`, `drafts::delete(&Session, &Id)` |
+| Contacts | `contacts::passwords(&Session, &[String])`, `contacts::store_passwords(&Session, &Passwords)` |
+| Import | `ImportMessage::parse(bytes, unread)`, `Session::import(&Id, ImportMessage) -> Option<Id>` |
+| Push | `Session::watch() -> Watch`, a `futures_core::Stream<Item = Result<WatchEvent>>`; `Watch::close` |
+| Diagnostics | `diagnostics::enable(prefix)`, or `TUTA_SDK_DEBUG=1` |
+
+Inputs that can be checked offline are typed and checked when built: `Id`,
+`Page`, `Name`, `Color`, `FolderEdit`, `LabelEdit`, `LabelChanges`,
+`Thread`, `ImportMessage`, `DraftRequest::check`. Every failure is an
+`Error`, a `#[non_exhaustive]` enum whose `code()` is the fixed snake_case
+code listed under [Error codes](#error-codes); `Error::from_code` maps a code
+back.
+
+**Sends and time limits.** Dropping a `send` future part-way loses the
+outcome of a submit that may already have gone out. To bound a send in time,
+use `send_within`, which keeps the [outcome rules](#send-outcomes): an
+overrun before the submit left is `Timeout` (nothing was sent), after it the
+submit's own status decides.
+
+The SDK prints a line of progress to stdout now and then (the helper parks
+fd 1 while it runs; an in-process GUI can ignore it).
+
+### Depending on it
+
+The library depends on crates that `prepare.sh` writes into `prepared/`, so
+it is not on crates.io. Three ways in:
+
+- **A git dependency on a vendored tag.** Each release also has a
+  `vX.Y.Z-vendored` tag: the same source with `prepared/` committed and the
+  submodule left out, so Cargo can build it straight from git, without
+  Python or the 500 MB tutanota checkout:
+
+  ```toml
+  [dependencies]
+  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.1.0-vendored" }
+  ```
+
+  `scripts/vendor.sh` makes such a tag from a release tag. The plain tags
+  and `main` do not build as git dependencies: nothing would run
+  `prepare.sh`.
+- **A path dependency on a submodule.** Add this repository as a submodule,
+  run its `prepare.sh` in your build, and depend on
+  `crates/tuta-unofficial-sdk` by path.
+- **A separate process.** Build `tuta-helper` and talk to it over the
+  [protocol](#the-helper-protocol). This keeps the SDK's large dependency
+  tree out of your own build and its crashes out of your process.
+
+For a Flatpak build, list `cargo-sources.json` (see
+[Packaging](#packaging)) beside your own crate sources, run `sh prepare.sh`
+(or use a vendored tag) before `cargo build --offline --locked`, and install
+the binary you need.
+
+## The helper protocol
+
+`tuta-helper` is the library behind a JSON protocol on private stdio: a
+caller starts it once per operation, writes one request to its stdin, reads
+one reply from its stdout, and waits for it to exit; only `watch`, which
+holds Tuta's push channel open, streams one line per change instead. The
+helper does not listen on a socket, keep a local cache, or speak any mail
+protocol. Decrypted mail goes back as headers, a body and attachments.
+
+Installed or linked under the name `hylki-tuta`, the same binary is the
+helper the Hylki mail client looks up, and behaves exactly as Hylki's own
+`hylki-tuta` did: sessions are named "Hylki" in the account's session list,
+and diagnostics follow `HYLKI_TUTA_DEBUG=1` with the `hylki-tuta:` prefix.
+Under any other name sessions are named "tuta-helper" and
+`TUTA_HELPER_DEBUG=1` turns diagnostics on. The protocol is the same either
+way.
+
 
 One UTF-8 JSON object goes to the helper on stdin, followed by EOF, and one
 JSON object comes back on stdout. Passwords, TOTP codes and session tokens
 never go in argv or the environment. The SDK prints progress to stdout, so the
 helper parks fd 1 on `/dev/null` while SDK code runs; stdout carries exactly
 one line. Requests are capped at 36 MiB (room for a 25 MiB `import` or a
-send's attachments in base64) and each operation at 90 seconds. Hylki
-allows 100 seconds including startup, then kills and reaps the process. The
-one exception is `watch`, which streams (see [Watch](#watch)).
+send's attachments in base64) and each operation at 90 seconds; a caller
+should allow some more for startup (Hylki allows 100 seconds), then kill and
+reap the process. The one exception is `watch`, which streams (see [Watch](#watch)).
 
 Every request carries `version: 1` and an `op`:
 
@@ -196,7 +360,7 @@ stored end-to-end encrypted like any other and reads the same in Tuta's own
 app:
 
 1. The message is converted by a port of the official importer's own code
-   (`src/import/mime.rs`, on the same `mail-parser` 0.10.2): one HTML body
+   (`crates/tuta-unofficial-sdk/src/import/mime.rs`, on the same `mail-parser` 0.10.2): one HTML body
    (plain text converted, of a `multipart/alternative` the last part), every
    other part an attachment, the raw header block kept, the sender, the
    recipients, Message-ID, In-Reply-To and References taken over. Its tests
@@ -321,8 +485,8 @@ never cleared. Passwords travel only in requests and replies on the private
 pipe: never in diagnostics.
 
 Keys are not verified. The official client only refuses a key that differs
-from one the user verified by hand (`KeyVerificationMismatchError`); Hylki
-has no verified contacts, so the current key from the public-key service is
+from one the user verified by hand (`KeyVerificationMismatchError`); this
+SDK keeps no verified contacts, so the current key from the public-key service is
 used, as the official client does for every unverified contact. The
 reported version and fingerprint are the hook for pinning keys later (trust
 on first use).
@@ -387,36 +551,99 @@ links the sent copy.
 
 ## Building and testing
 
-With a Rust toolchain and a C compiler, from the repository root:
+With a Rust toolchain (1.84 or newer), a C compiler, Python 3 and git:
 
 ```sh
-git submodule update --init --recursive
-native/tuta/prepare.sh
-cd native/tuta
-cargo build --locked --offline
-cargo test --locked --offline
+git clone --recursive https://github.com/tuna-os/tuta-unofficial-sdk
+cd tuta-unofficial-sdk
+sh prepare.sh
+cargo build --locked
+cargo test --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt -p tuta-unofficial-sdk -p tuta-helper --check
+cargo deny check
 ```
 
-The first build needs the crates in Cargo's cache; drop `--offline` to fetch
-them. The Flatpak build has no network, so `cargo-sources.json` lists every
-crate from `Cargo.lock` for flatpak-builder. Regenerate it with
-flatpak-builder-tools' `flatpak-cargo-generator.py` after any `Cargo.lock`
-change, or the offline build fails. See [BUILDING.md](../../docs/BUILDING.md)
-for packaging.
+`git submodule update --init --recursive` fetches the submodules of an
+existing clone. `prepare.sh` is a quick no-op when `prepared/` is current;
+run it again after updating the submodule or `sdk-patches/`.
+
+The example signs in, lists the folders, reads the newest Inbox mail and
+closes its session again:
+
+```sh
+TUTA_EMAIL=ada@tuta.com cargo run --example read_mail   # password on stdin
+```
+
+### Live tests
+
+The unit tests never touch the network. Two live tests, `#[ignore]`d and
+gated on `TUTA_LIVE=1`, run against Tuta's servers with a test account's
+`TUTA_LIVE_EMAIL`, `TUTA_LIVE_PASSWORD` and, when it has a second factor,
+`TUTA_LIVE_TOTP`:
+
+```sh
+TUTA_LIVE=1 TUTA_LIVE_EMAIL=... TUTA_LIVE_PASSWORD=... TUTA_LIVE_TOTP=... \
+    cargo test -p tuta-unofficial-sdk --test live -- --ignored
+TUTA_LIVE=1 ... cargo test -p tuta-helper --test live -- --ignored
+```
+
+The library's signs in once, lists folders and labels, resumes the saved
+session, saves, updates and discards a draft, watches the event bus, sends
+one confidential mail with an attachment to the account itself, reads the
+received copy back (body, attachment, MIME), marks it read, and deletes both
+copies for good before closing its session. The helper's signs in once
+through the binary, syncs, reads the newest mail through the `hylki-tuta`
+name and lists labels, then revokes the session; it sends nothing. A TOTP
+code is good for one sign-in: take a fresh one for each.
+
+## Packaging
+
+The Flatpak build has no network, so `cargo-sources.json` lists every crate
+from `Cargo.lock` for flatpak-builder. Regenerate it after any `Cargo.lock`
+change, or the offline build fails:
+
+```sh
+scripts/cargo-sources.sh   # needs curl and uv
+```
+
+It runs flatpak-builder-tools' `flatpak-cargo-generator.py` at a pinned
+commit, checked against its SHA-256. CI fails when the committed file is
+stale.
+
+The binary is built as `tuta-helper`. A package that replaces Hylki's
+helper installs it (or a symlink to it) as `hylki-tuta`, for example
+`install -Dm755 target/release/tuta-helper /app/bin/tuta-helper` and
+`ln -s tuta-helper /app/bin/hylki-tuta`.
+
+## Patches policy
+
+- A patch to the SDK exposes what the official client already does, with a
+  pointer to the TypeScript it ports; it adds no cryptography, and it is
+  as small as the job allows. Behaviour that can live in this repository's
+  own code lives there instead.
+- Patches apply in name order (`NN-topic.patch`) to the SDK prepared by
+  tutabridge, and `prepare.sh` refuses one that does not apply cleanly.
+- Each patch's description stays current in the
+  [Security model](#security-model) list.
+- When tutabridge moves its SDK pin, every patch is reviewed against the new
+  `upstream/sdk/EXPECTED` and rebased or dropped; a patch Tuta merges
+  upstream is dropped.
 
 ## Debugging
 
-With `HYLKI_TUTA_DEBUG=1` in its environment, the helper writes diagnostics to
-stderr, each line prefixed `hylki-tuta:`: every HTTP request as method, service
-path and status (no host, query, body or ids), and the Debug form of every SDK
-error with the stage it broke in (sign-in, recipient resolution, recipient
-keys, secure external keys, blob upload, draft create, draft load, attachment
-keys, send draft, draft cleanup, the parent's reply mark, contact load,
-contact create, contact password, folder and label services, deletes, the
-event bus).
-Addresses, ids, tokens and key bytes are redacted, and no message content or
-password is printed. Hylki discards the helper's stderr, so run the helper by
-hand to see it.
+With `TUTA_SDK_DEBUG=1` (or `TUTA_HELPER_DEBUG=1` for the helper,
+`HYLKI_TUTA_DEBUG=1` under the `hylki-tuta` name) in the environment, the
+library writes diagnostics to stderr, each line prefixed with the program's
+name: every HTTP request as method, service path and status (no host, query,
+body or ids), and the Debug form of every SDK error with the stage it broke
+in (sign-in, recipient resolution, recipient keys, secure external keys,
+blob upload, draft create, draft load, attachment keys, send draft, draft
+cleanup, the parent's reply mark, contact load, contact create, contact
+password, folder and label services, deletes, the event bus). Addresses,
+ids, tokens and key bytes are redacted, and no message content or password
+is printed. A caller that discards the helper's stderr sees none of it, so
+run the helper by hand to see it.
 
 ## Known limits
 
@@ -432,7 +659,7 @@ hand to see it.
   recipients, which the official client also stores unless the account
   turned automatic contacts off.
 - The first password-protected send to an address creates an external user
-  for it on the server, and the helper offers no way to remove one. A later
+  for it on the server, and this SDK offers no way to remove one. A later
   send to that address uses it again.
 - Password-protected delivery is refused from a shared mailbox and for an
   external (secure-mail) user, as in the official client.
@@ -442,5 +669,12 @@ hand to see it.
 - `watch` reports which folders changed, not what changed in them; the caller
   syncs those folders. Missed batches are replayed only while one `watch`
   runs: a new `watch` starts from the present.
-- Sessions are not refreshed. Each operation resumes the stored session, and
-  a revoked or expired one means signing in again.
+- Sessions are not refreshed. Each helper operation resumes the stored
+  session, and a revoked or expired one means signing in again.
+- The SDK prints some progress to stdout. The helper parks fd 1 while it
+  runs; an in-process caller that needs a clean stdout must do the same.
+
+## License
+
+GPL-3.0-or-later (see `LICENSE`), as the Tuta SDK and tutabridge are. The
+helper runs as a separate program from its caller.
