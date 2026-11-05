@@ -1,11 +1,14 @@
-//! How a send is delivered: confidentially (end-to-end encrypted, Tuta
-//! recipients only) or ordinarily, and the key material each mode hands
+//! How a send is delivered: confidentially (end-to-end encrypted: Tuta
+//! recipients through their public keys, recipients elsewhere through a
+//! password) or ordinarily, and the key material each mode hands
 //! `SendDraftService`. Mirrors the official client's `MailFacade.sendDraft`.
 //!
-//! No public-key cryptography happens here. Recipient keys are loaded and the
-//! bucket key is encrypted for them inside the SDK, through the audited
-//! `AsymmetricCryptoFacade` path that Hylki's SDK patch exposes
-//! (`sdk-patches/01-recipient-key-data.patch`); this module only wraps
+//! No public-key or passphrase cryptography happens here. Recipient keys are
+//! loaded and the bucket key is encrypted for them inside the SDK, through the
+//! audited `AsymmetricCryptoFacade` path that Hylki's SDK patch exposes
+//! (`sdk-patches/01-recipient-key-data.patch`), and a password-protected
+//! recipient's key data is built there too
+//! (`sdk-patches/04-secure-external-recipient.patch`); this module only wraps
 //! symmetric keys with the SDK's own AES functions, as the ordinary path
 //! already did.
 //!
@@ -15,7 +18,8 @@
 //! for every unverified contact. Each recipient's key version and fingerprint
 //! is reported back, so a caller can pin keys (trust on first use) later.
 
-use crate::{aggregate_id, diag, Delivery, RecipientKind, Result, SEND_LANGUAGE};
+use crate::secure_external::Passwords;
+use crate::{aggregate_id, diag, RecipientKind, Result, SEND_LANGUAGE};
 use crypto_primitives::{
     aes::InitializationVector, key::GenericAesKey, randomizer_facade::RandomizerFacade,
 };
@@ -26,8 +30,10 @@ use tutasdk::{
         AsymmetricCryptoError, InternalRecipientKey, InternalRecipientKeyError,
     },
     crypto::public_key_provider::PublicKeyLoadingError,
+    crypto::secure_external_facade::{SecureExternalRecipient, SecureExternalRecipientError},
     entities::generated::tutanota::{
-        AttachmentKeyData, InternalRecipientKeyData, SendDraftData, SendDraftParameters,
+        AttachmentKeyData, InternalRecipientKeyData, SecureExternalRecipientKeyData, SendDraftData,
+        SendDraftParameters,
     },
     tutanota_constants::{CryptoProtocolVersion, EncryptionAuthStatus},
     ApiCallError, GeneratedId, IdTupleGenerated, LoggedInSdk,
@@ -37,8 +43,13 @@ use tutasdk::{
 /// written server-side.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
-    /// End-to-end encrypted for every recipient, all of them on Tuta.
-    Confidential,
+    /// End-to-end encrypted for every recipient: the Tuta ones (`internal`)
+    /// through their public keys, the others (`external`) through the
+    /// password each was given. Distinct addresses, request order.
+    Confidential {
+        internal: Vec<String>,
+        external: Vec<String>,
+    },
     /// Encrypted in transit only, for everyone. Carries the (internal,
     /// external) counts, or None when a lookup failed but an external
     /// recipient settled the mode anyway.
@@ -48,38 +59,60 @@ pub(crate) enum Plan {
 /// The official client's rule: a mail is confidential when the user asked
 /// for it or when no recipient is external (`SendMailModel.isConfidential()`
 /// is `confidential || !containsExternalRecipients()`). So an all-Tuta send
-/// is always encrypted end to end and needs no consent, whatever `delivery`
-/// says, and ordinary delivery reaches every recipient of a mixed send
-/// alike.
+/// is always encrypted end to end and needs no consent, whatever
+/// `confidential` says; a confidential send with recipients outside Tuta
+/// reaches them password-protected; ordinary delivery reaches every
+/// recipient of a mixed send alike.
 ///
-/// Refusals, all definitive and before any server-side write:
-/// - `secure` with an external recipient: that needs a password-protected
-///   secure-external delivery, which the helper does not offer.
+/// `recipients` pairs each distinct address with its kind. Refusals, all
+/// definitive and before any server-side write:
+/// - confidential, and a recipient outside Tuta has no password:
+///   `password_required`, naming nobody (TS `noPreSharedPassword_msg`).
 /// - ordinary delivery without `ordinary_confirmed`.
-/// - no external recipient but a failed lookup: the mode cannot be decided,
-///   so the lookup's own code.
+/// - a failed lookup where it decides the mode or a recipient's key: the
+///   lookup's own code. An ordinary send to someone outside Tuta needs no
+///   key, so a failed lookup does not stop it.
 pub(crate) fn plan(
-    delivery: &Delivery,
+    confidential: bool,
     ordinary_confirmed: bool,
-    kinds: &[RecipientKind],
+    recipients: &[(String, RecipientKind)],
+    passwords: &Passwords,
 ) -> Result<Plan> {
-    let count = |wanted: RecipientKind| kinds.iter().filter(|&&kind| kind == wanted).count();
+    let of_kind = |wanted: RecipientKind| -> Vec<String> {
+        recipients
+            .iter()
+            .filter(|(_, kind)| *kind == wanted)
+            .map(|(address, _)| address.clone())
+            .collect()
+    };
     let (internal, external) = (
-        count(RecipientKind::Internal),
-        count(RecipientKind::External),
+        of_kind(RecipientKind::Internal),
+        of_kind(RecipientKind::External),
     );
-    let unknown = kinds.iter().find_map(|kind| match kind {
+    let unknown = recipients.iter().find_map(|(_, kind)| match kind {
         RecipientKind::Unknown(code) => Some(*code),
         _ => None,
     });
-    match (external, unknown) {
-        (0, Some(code)) => Err(code),
-        (0, None) => Ok(Plan::Confidential),
-        _ if *delivery == Delivery::Secure => Err("secure_external_unsupported"),
-        _ if !ordinary_confirmed => Err("ordinary_delivery_requires_consent"),
-        (_, Some(_)) => Ok(Plan::Ordinary(None)),
-        (_, None) => Ok(Plan::Ordinary(Some((internal, external)))),
+    if external.is_empty() || confidential {
+        if external
+            .iter()
+            .any(|address| passwords.get(address).is_none())
+        {
+            return Err("password_required");
+        }
+        if let Some(code) = unknown {
+            return Err(code);
+        }
+        return Ok(Plan::Confidential { internal, external });
     }
+    if !ordinary_confirmed {
+        return Err("ordinary_delivery_requires_consent");
+    }
+    Ok(Plan::Ordinary(
+        unknown
+            .is_none()
+            .then_some((internal.len(), external.len())),
+    ))
 }
 
 /// Every address once, first spelling kept: the official client files one
@@ -103,6 +136,9 @@ pub(crate) async fn recipient_keys(
     bucket_key: &GenericAesKey,
     addresses: &[String],
 ) -> Result<Vec<InternalRecipientKey>> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
     sdk.encrypt_bucket_key_for_internal_recipients(sender_mail_group_id, bucket_key, addresses)
         .await
         .map_err(|error| match error {
@@ -122,6 +158,55 @@ pub(crate) async fn recipient_keys(
                     | AsymmetricCryptoError::PublicKeyLoadingError(
                         PublicKeyLoadingError::KeyLoadingError(ApiCallError::RestClient { .. }),
                     ) => "transport_failed",
+                    _ => "send_failed",
+                }
+            }
+        })
+}
+
+/// The bucket key for every recipient outside Tuta, behind the password the
+/// sender gave them, by the SDK: it derives the password key (Argon2id over a
+/// fresh salt) and creates the recipient's external user on first use.
+/// `plan` has checked every password is there.
+pub(crate) async fn secure_external_keys(
+    sdk: &LoggedInSdk,
+    sender_mail_group_id: &GeneratedId,
+    bucket_key: &GenericAesKey,
+    addresses: &[String],
+    passwords: &Passwords,
+) -> Result<Vec<SecureExternalRecipientKeyData>> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let recipients: Vec<SecureExternalRecipient> = addresses
+        .iter()
+        .map(|address| SecureExternalRecipient {
+            mail_address: address,
+            passphrase: passwords.get(address).unwrap_or_default(),
+        })
+        .collect();
+    sdk.secure_external_recipient_key_data(sender_mail_group_id, bucket_key, &recipients)
+        .await
+        .map_err(|error| match error {
+            // Its Debug form lists addresses: count them instead.
+            SecureExternalRecipientError::MissingPassphrase(missing) => {
+                diag::note(&format!(
+                    "secure external keys: {} without a password",
+                    missing.len()
+                ));
+                "password_required"
+            }
+            SecureExternalRecipientError::ExternalSender
+            | SecureExternalRecipientError::SharedMailboxSender => {
+                diag::failed("secure external keys", &error);
+                "secure_external_sender_unsupported"
+            }
+            error => {
+                diag::failed("secure external keys", &error);
+                match error {
+                    SecureExternalRecipientError::ApiCall(ApiCallError::RestClient { .. }) => {
+                        "transport_failed"
+                    }
                     _ => "send_failed",
                 }
             }
@@ -167,12 +252,15 @@ impl RecipientReport {
 pub(crate) struct Delivered {
     pub(crate) confidential: bool,
     pub(crate) recipients: Vec<RecipientReport>,
+    /// The recipients outside Tuta that got it password-protected.
+    pub(crate) secure_external: Vec<String>,
 }
 
 impl Delivered {
     pub(crate) fn to_json(&self) -> Value {
         json!({"confidential": self.confidential,
-            "recipients": self.recipients.iter().map(RecipientReport::to_json).collect::<Vec<_>>()})
+            "recipients": self.recipients.iter().map(RecipientReport::to_json).collect::<Vec<_>>(),
+            "secure_external": self.secure_external})
     }
 }
 
@@ -199,7 +287,15 @@ pub(crate) struct MailKeys {
     bucket_enc_mail_session_key: Option<Vec<u8>>,
     attachment_keys: Vec<AttachmentKeyData>,
     internal_recipient_key_data: Vec<InternalRecipientKeyData>,
+    secure_external_recipient_key_data: Vec<SecureExternalRecipientKeyData>,
+    sender_name_unencrypted: Option<String>,
     session_enc_encryption_auth_status: Option<Vec<u8>>,
+}
+
+/// A confidential send's per-recipient key data, as the SDK built it.
+pub(crate) struct RecipientKeyData {
+    pub(crate) internal: Vec<InternalRecipientKeyData>,
+    pub(crate) secure_external: Vec<SecureExternalRecipientKeyData>,
 }
 
 /// Ordinary delivery hands the server the clear session keys, exactly as the
@@ -221,6 +317,8 @@ pub(crate) fn ordinary_keys(
             })
             .collect(),
         internal_recipient_key_data: Vec::new(),
+        secure_external_recipient_key_data: Vec::new(),
+        sender_name_unencrypted: None,
         session_enc_encryption_auth_status: None,
     }
 }
@@ -229,19 +327,25 @@ pub(crate) fn ordinary_keys(
 /// and every attachment's are wrapped with the bucket key, which only the
 /// recipients can unwrap. When every recipient key is TutaCrypt the mail also
 /// carries its own authentication status (`TutacryptSender`) encrypted with
-/// the mail session key, as `MailFacade.isTutaCryptMail` decides.
+/// the mail session key, as `MailFacade.isTutaCryptMail` decides; any
+/// password-protected recipient rules that out. The server's notification
+/// to such a recipient names the sender, so the mail then carries
+/// `sender_name` in the clear, as the official client sends it.
 pub(crate) fn confidential_keys(
     bucket_key: &GenericAesKey,
     mail_session_key: &GenericAesKey,
     files: &[(IdTupleGenerated, GenericAesKey)],
-    recipients: Vec<InternalRecipientKeyData>,
+    recipients: RecipientKeyData,
+    sender_name: &str,
     randomizer: &RandomizerFacade,
 ) -> Result<MailKeys> {
     let wrap = |key: &GenericAesKey| {
         bucket_key.encrypt_key(key, InitializationVector::generate(randomizer))
     };
-    let is_tuta_crypt = !recipients.is_empty()
+    let is_tuta_crypt = recipients.secure_external.is_empty()
+        && !recipients.internal.is_empty()
         && recipients
+            .internal
             .iter()
             .all(|r| r.protocolVersion == CryptoProtocolVersion::TutaCrypt as i64);
     let session_enc_encryption_auth_status = if is_tuta_crypt {
@@ -257,6 +361,8 @@ pub(crate) fn confidential_keys(
     } else {
         None
     };
+    let sender_name_unencrypted =
+        (!recipients.secure_external.is_empty()).then(|| sender_name.to_string());
     Ok(MailKeys {
         mail_session_key: None,
         bucket_enc_mail_session_key: Some(wrap(mail_session_key)),
@@ -269,7 +375,9 @@ pub(crate) fn confidential_keys(
                 file: file.clone(),
             })
             .collect(),
-        internal_recipient_key_data: recipients,
+        internal_recipient_key_data: recipients.internal,
+        secure_external_recipient_key_data: recipients.secure_external,
+        sender_name_unencrypted,
         session_enc_encryption_auth_status,
     })
 }
@@ -301,13 +409,22 @@ pub(crate) fn send_payload(
             })
             .collect()
     };
+    let secure_externals = || -> Vec<SecureExternalRecipientKeyData> {
+        keys.secure_external_recipient_key_data
+            .iter()
+            .map(|key| SecureExternalRecipientKeyData {
+                _id: aggregate_id(randomizer),
+                ..key.clone()
+            })
+            .collect()
+    };
     SendDraftData {
         _format: 0,
         language: SEND_LANGUAGE.to_string(),
         mailSessionKey: keys.mail_session_key.clone(),
         bucketEncMailSessionKey: keys.bucket_enc_mail_session_key.clone(),
         // Only a secure-external recipient's notification mail reads it.
-        senderNameUnencrypted: None,
+        senderNameUnencrypted: keys.sender_name_unencrypted.clone(),
         // Plaintext stays off in both copies: the official client reads the
         // account's sendPlaintextOnly property, but Hylki has no such
         // setting and always composes HTML, so the flag matches the content
@@ -318,7 +435,7 @@ pub(crate) fn send_payload(
         sendAt: None,
         allowUndo: false,
         internalRecipientKeyData: recipients(),
-        secureExternalRecipientKeyData: Vec::new(),
+        secureExternalRecipientKeyData: secure_externals(),
         attachmentKeyData: attachments(),
         mail: draft.clone(),
         symEncInternalRecipientKeyData: Vec::new(),
@@ -327,13 +444,13 @@ pub(crate) fn send_payload(
             language: SEND_LANGUAGE.to_string(),
             mailSessionKey: keys.mail_session_key.clone(),
             bucketEncMailSessionKey: keys.bucket_enc_mail_session_key.clone(),
-            senderNameUnencrypted: None,
+            senderNameUnencrypted: keys.sender_name_unencrypted.clone(),
             plaintext: false,
             calendarMethod: false,
             sessionEncEncryptionAuthStatus: keys.session_enc_encryption_auth_status.clone(),
             mail: draft,
             internalRecipientKeyData: recipients(),
-            secureExternalRecipientKeyData: Vec::new(),
+            secureExternalRecipientKeyData: secure_externals(),
             symEncInternalRecipientKeyData: Vec::new(),
             attachmentKeyData: attachments(),
         }),
@@ -371,73 +488,152 @@ mod tests {
         }
     }
 
+    /// Recipients `r0@example.org`, `r1@example.org`, ... of these kinds.
+    fn people(kinds: &[RecipientKind]) -> Vec<(String, RecipientKind)> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| (format!("r{i}@example.org"), *kind))
+            .collect()
+    }
+
+    fn passwords(json: &str) -> Passwords {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn addresses(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
     #[test]
     fn an_all_tuta_send_is_confidential_without_consent() {
-        for delivery in [Delivery::Ordinary, Delivery::Secure] {
+        for confidential in [false, true] {
             for confirmed in [false, true] {
                 assert_eq!(
-                    plan(&delivery, confirmed, &[Internal]),
-                    Ok(Plan::Confidential)
-                );
-                assert_eq!(
-                    plan(&delivery, confirmed, &[Internal, Internal]),
-                    Ok(Plan::Confidential)
+                    plan(
+                        confidential,
+                        confirmed,
+                        &people(&[Internal]),
+                        &Passwords::default()
+                    ),
+                    Ok(Plan::Confidential {
+                        internal: addresses(&["r0@example.org"]),
+                        external: Vec::new(),
+                    })
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_confidential_send_reaches_outside_tuta_with_a_password_for_everyone() {
+        let with_password = passwords(r#"{"R1@Example.org":" pw ","r2@example.org":"x"}"#);
+        for confirmed in [false, true] {
+            assert_eq!(
+                plan(
+                    true,
+                    confirmed,
+                    &people(&[Internal, External, External]),
+                    &with_password
+                ),
+                Ok(Plan::Confidential {
+                    internal: addresses(&["r0@example.org"]),
+                    external: addresses(&["r1@example.org", "r2@example.org"]),
+                })
+            );
+        }
+        assert_eq!(
+            plan(
+                true,
+                false,
+                &people(&[External]),
+                &passwords(r#"{"r0@example.org":"pw"}"#)
+            ),
+            Ok(Plan::Confidential {
+                internal: Vec::new(),
+                external: addresses(&["r0@example.org"]),
+            })
+        );
+    }
+
+    #[test]
+    fn a_confidential_send_without_every_password_is_refused() {
+        for given in [
+            r#"{}"#,
+            r#"{"r1@example.org":"pw"}"#,
+            r#"{"r1@example.org":"pw","r2@example.org":"   "}"#,
+        ] {
+            assert_eq!(
+                plan(
+                    true,
+                    true,
+                    &people(&[Internal, External, External]),
+                    &passwords(given)
+                ),
+                Err("password_required"),
+                "{given}"
+            );
         }
     }
 
     #[test]
     fn a_mixed_send_is_ordinary_for_everyone_only_with_consent() {
-        let delivery = Delivery::Ordinary;
+        // Passwords given or not, an ordinary send ignores them.
+        let given = passwords(r#"{"r1@example.org":"pw"}"#);
         assert_eq!(
-            plan(&delivery, true, &[Internal, External]),
+            plan(false, true, &people(&[Internal, External]), &given),
             Ok(Plan::Ordinary(Some((1, 1))))
         );
         assert_eq!(
-            plan(&delivery, true, &[External]),
+            plan(false, true, &people(&[External]), &Passwords::default()),
             Ok(Plan::Ordinary(Some((0, 1))))
         );
         assert_eq!(
-            plan(&delivery, false, &[Internal, External]),
+            plan(false, false, &people(&[Internal, External]), &given),
             Err("ordinary_delivery_requires_consent")
         );
         // A failed lookup leaves the counts unknown, not the send.
         assert_eq!(
-            plan(&delivery, true, &[External, Unknown("transport_failed")]),
+            plan(
+                false,
+                true,
+                &people(&[External, Unknown("transport_failed")]),
+                &Passwords::default()
+            ),
             Ok(Plan::Ordinary(None))
         );
     }
 
     #[test]
-    fn secure_delivery_never_falls_back_to_ordinary() {
-        for kinds in [
-            &[External][..],
-            &[Internal, External],
-            &[External, Unknown("transport_failed")],
-        ] {
-            for confirmed in [false, true] {
-                assert_eq!(
-                    plan(&Delivery::Secure, confirmed, kinds),
-                    Err("secure_external_unsupported")
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_undecidable_mode_refuses_with_the_lookup_code() {
+    fn an_undecidable_confidential_send_refuses_with_the_lookup_code() {
         assert_eq!(
             plan(
-                &Delivery::Ordinary,
+                false,
                 true,
-                &[Internal, Unknown("transport_failed")]
+                &people(&[Internal, Unknown("transport_failed")]),
+                &Passwords::default()
             ),
             Err("transport_failed")
         );
         assert_eq!(
-            plan(&Delivery::Secure, false, &[Unknown("send_failed")]),
+            plan(
+                true,
+                false,
+                &people(&[Unknown("send_failed")]),
+                &Passwords::default()
+            ),
             Err("send_failed")
+        );
+        // Confidential with someone outside Tuta: an unknown recipient might
+        // need a password or a key, so the send cannot go.
+        assert_eq!(
+            plan(
+                true,
+                true,
+                &people(&[External, Unknown("transport_failed")]),
+                &passwords(r#"{"r0@example.org":"pw"}"#)
+            ),
+            Err("transport_failed")
         );
     }
 
@@ -467,7 +663,11 @@ mod tests {
             &bucket_key,
             &mail_session_key,
             &files,
-            vec![recipient("ada@tuta.com", CryptoProtocolVersion::TutaCrypt)],
+            internal_only(vec![recipient(
+                "ada@tuta.com",
+                CryptoProtocolVersion::TutaCrypt,
+            )]),
+            "Me",
             &randomizer,
         )
         .unwrap();
@@ -527,10 +727,11 @@ mod tests {
             &random_key(&randomizer),
             &random_key(&randomizer),
             &[],
-            vec![
+            internal_only(vec![
                 recipient("ada@tuta.com", CryptoProtocolVersion::TutaCrypt),
                 recipient("old@tutanota.de", CryptoProtocolVersion::Rsa),
-            ],
+            ]),
+            "Me",
             &randomizer,
         )
         .unwrap();
@@ -541,6 +742,103 @@ mod tests {
             .unwrap()
             .sessionEncEncryptionAuthStatus
             .is_none());
+    }
+
+    fn internal_only(internal: Vec<InternalRecipientKeyData>) -> RecipientKeyData {
+        RecipientKeyData {
+            internal,
+            secure_external: Vec::new(),
+        }
+    }
+
+    fn secure_external(address: &str) -> SecureExternalRecipientKeyData {
+        SecureExternalRecipientKeyData {
+            _id: None,
+            mailAddress: address.to_string(),
+            passwordVerifier: vec![1; 32],
+            salt: Some(vec![2; 16]),
+            saltHash: Some(vec![3; 32]),
+            pwEncCommunicationKey: Some(vec![4; 64]),
+            ownerEncBucketKey: vec![5; 64],
+            kdfVersion: 1,
+            ownerKeyVersion: 0,
+            userGroupKeyVersion: 0,
+        }
+    }
+
+    #[test]
+    fn a_password_protected_recipient_names_the_sender_and_drops_the_auth_status() {
+        // TS `isTutaCryptMail`: a secure external recipient makes the mail
+        // non-TutaCrypt even when every Tuta recipient's key is TutaCrypt.
+        let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        let bucket_key = random_key(&randomizer);
+        let mail_session_key = random_key(&randomizer);
+        let keys = confidential_keys(
+            &bucket_key,
+            &mail_session_key,
+            &[(file("a"), random_key(&randomizer))],
+            RecipientKeyData {
+                internal: vec![recipient("ada@tuta.com", CryptoProtocolVersion::TutaCrypt)],
+                secure_external: vec![secure_external("ext@example.org")],
+            },
+            "Me Myself",
+            &randomizer,
+        )
+        .unwrap();
+        let payload = send_payload(draft(), keys, &randomizer);
+        let parameters = payload.parameters.as_ref().unwrap();
+        assert!(payload.sessionEncEncryptionAuthStatus.is_none());
+        assert!(parameters.sessionEncEncryptionAuthStatus.is_none());
+        assert_eq!(payload.senderNameUnencrypted.as_deref(), Some("Me Myself"));
+        assert_eq!(
+            parameters.senderNameUnencrypted.as_deref(),
+            Some("Me Myself")
+        );
+        for (externals, internals) in [
+            (
+                &payload.secureExternalRecipientKeyData,
+                &payload.internalRecipientKeyData,
+            ),
+            (
+                &parameters.secureExternalRecipientKeyData,
+                &parameters.internalRecipientKeyData,
+            ),
+        ] {
+            assert_eq!(externals.len(), 1);
+            assert_eq!(internals.len(), 1);
+            let external = &externals[0];
+            assert_eq!(external.mailAddress, "ext@example.org");
+            assert_eq!(external.ownerEncBucketKey, vec![5; 64]);
+            let id = external._id.as_ref().expect("aggregate without an id");
+            assert_eq!(URL_SAFE_NO_PAD.decode(id.as_str()).unwrap().len(), 4);
+        }
+        // Still confidential: no session key in the clear.
+        assert!(payload.mailSessionKey.is_none());
+        assert!(payload.attachmentKeyData[0].fileSessionKey.is_none());
+        assert_eq!(
+            bucket_key
+                .decrypt_aes_key(payload.bucketEncMailSessionKey.as_ref().unwrap())
+                .unwrap(),
+            mail_session_key
+        );
+
+        // Only password-protected recipients: no auth status either.
+        let keys = confidential_keys(
+            &bucket_key,
+            &mail_session_key,
+            &[],
+            RecipientKeyData {
+                internal: Vec::new(),
+                secure_external: vec![secure_external("ext@example.org")],
+            },
+            "Me",
+            &randomizer,
+        )
+        .unwrap();
+        let payload = send_payload(draft(), keys, &randomizer);
+        assert!(payload.sessionEncEncryptionAuthStatus.is_none());
+        assert!(payload.internalRecipientKeyData.is_empty());
+        assert_eq!(payload.senderNameUnencrypted.as_deref(), Some("Me"));
     }
 
     #[test]
@@ -593,10 +891,11 @@ mod tests {
             &random_key(&randomizer),
             &random_key(&randomizer),
             &files,
-            vec![
+            internal_only(vec![
                 recipient("ada@tuta.com", CryptoProtocolVersion::TutaCrypt),
                 recipient("bo@tuta.com", CryptoProtocolVersion::TutaCrypt),
-            ],
+            ]),
+            "Me",
             &randomizer,
         )
         .unwrap();
@@ -631,9 +930,11 @@ mod tests {
         let delivered = Delivered {
             confidential: true,
             recipients: vec![RecipientReport::of(&key)],
+            secure_external: vec!["ext@example.org".to_string()],
         };
         let reply = delivered.to_json();
         assert_eq!(reply["confidential"], json!(true));
+        assert_eq!(reply["secure_external"], json!(["ext@example.org"]));
         let row = &reply["recipients"][0];
         assert_eq!(row["address"], json!("ada@tuta.com"));
         assert_eq!(row["key_version"], json!(2));

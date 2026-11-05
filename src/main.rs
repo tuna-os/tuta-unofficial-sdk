@@ -5,6 +5,7 @@ mod diag;
 mod drafts;
 mod import;
 mod mailbox_ops;
+mod secure_external;
 mod thread;
 mod transport;
 mod watch;
@@ -93,8 +94,8 @@ const SENT_FOLDER_TYPE: i64 = 2;
 const TRASH_FOLDER_TYPE: i64 = 3;
 const METHOD_NONE: i64 = 0;
 // The notification language on the send call. Only the server's notification
-// mails (external password delivery, which this helper refuses to compose)
-// read it; an ordinary send delivers as a normal mail.
+// mail to a password-protected recipient reads it; an ordinary or all-Tuta
+// send delivers as a normal mail. Hylki offers no language choice for it.
 const SEND_LANGUAGE: &str = "en";
 
 type Result<T> = std::result::Result<T, &'static str>;
@@ -198,8 +199,13 @@ enum Operation {
         reply_tos: Vec<SendRecipient>,
         subject: String,
         body_html: String,
-        delivery: Delivery,
+        /// End-to-end encryption asked for; an all-Tuta send is end-to-end
+        /// encrypted either way (see `delivery::plan`).
+        confidential: bool,
         ordinary_confirmed: bool,
+        /// Passwords for the recipients outside Tuta of a confidential send.
+        #[serde(default)]
+        passwords: secure_external::Passwords,
         attachments: Vec<SendAttachment>,
         /// The parent's Message-ID, for a reply or forward (see `thread`).
         in_reply_to: Option<String>,
@@ -221,22 +227,12 @@ enum Operation {
     Delete(mailbox_ops::DeleteMails),
     EmptyFolder(mailbox_ops::EmptyFolder),
     SaveDraft(drafts::SaveDraft),
+    ContactPasswords(secure_external::ContactPasswords),
+    StoreContactPasswords(secure_external::StoreContactPasswords),
     DeleteDraft(drafts::DeleteDraft),
     Import(import::Import),
     /// Streaming; served by `watch::serve` before `dispatch` (see `main`).
     Watch(watch::Watch),
-}
-
-/// Which delivery the caller chose; there is no default. `ordinary` is the
-/// official client's own default: end-to-end encrypted when every recipient
-/// is on Tuta, ordinary for everyone otherwise -- and only then does it need
-/// `ordinary_confirmed`. `secure` is end-to-end encrypted or refused, never
-/// ordinary. See `delivery::plan`.
-#[derive(Deserialize, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-enum Delivery {
-    Secure,
-    Ordinary,
 }
 
 #[derive(Deserialize)]
@@ -473,6 +469,9 @@ fn sent_reply(
         "external_recipients": counts.map(|(_, external)| external),
         "confidential": null,
         "recipients": null,
+        "secure_external": null,
+        // Set by `send` once the submit went out; null when a run overran.
+        "contacts_saved": null,
     });
     if let (Some(fields), Some(Value::Object(mode))) = (
         result.as_object_mut(),
@@ -969,8 +968,9 @@ async fn send(
     reply_tos: Vec<SendRecipient>,
     subject: String,
     body_html: String,
-    requested: Delivery,
+    confidential: bool,
     ordinary_confirmed: bool,
+    passwords: secure_external::Passwords,
     attachments: Vec<SendAttachment>,
     thread: thread::Thread,
 ) -> Result<Value> {
@@ -1028,28 +1028,36 @@ async fn send(
         .map_err(diag::fail("sender group key", "send_failed"))?;
     // Decided before any server-side write (blob upload, draft, submit): a
     // send that can go out in neither mode is refused here, and so is a
-    // confidential one with an unknown Tuta recipient. The recipients' keys
-    // are loaded and the bucket key encrypted for them now, for the same
-    // reason.
-    let plan = delivery::plan(
-        &requested,
-        ordinary_confirmed,
-        &classify_recipients(&sdk, &addresses).await,
-    )?;
+    // confidential one with an unknown Tuta recipient or a recipient outside
+    // Tuta without a password. The recipients' keys are loaded and the
+    // bucket key encrypted for them now, for the same reason; only a first
+    // password-protected send to an address creates its external user here,
+    // as the official client does while sending.
+    let unique = delivery::unique_addresses(&addresses);
+    let kinds = classify_recipients(&sdk, &unique).await;
+    let recipients: Vec<(String, RecipientKind)> = unique.into_iter().zip(kinds).collect();
+    let plan = delivery::plan(confidential, ordinary_confirmed, &recipients, &passwords)?;
     let (counts, confidential) = match plan {
         delivery::Plan::Ordinary(counts) => (counts, None),
-        delivery::Plan::Confidential => {
+        delivery::Plan::Confidential { internal, external } => {
             let bucket_key = GenericAesKey::Aes256(Aes256Key::generate(&randomizer));
-            let recipients = delivery::recipient_keys(
+            let internal_keys =
+                delivery::recipient_keys(&sdk, &mail_group_id, &bucket_key, &internal).await?;
+            let secure_external = delivery::secure_external_keys(
                 &sdk,
                 &mail_group_id,
                 &bucket_key,
-                &delivery::unique_addresses(&addresses),
+                &external,
+                &passwords,
             )
             .await?;
-            (Some((addresses.len(), 0)), Some((bucket_key, recipients)))
+            (
+                Some((internal.len(), external.len())),
+                Some((bucket_key, internal_keys, secure_external, external)),
+            )
         }
     };
+    let sender_display_name = encrypted_name(&sender_name, &sender);
     let file_data: Vec<FileData> = staged
         .iter()
         .map(|s| FileData {
@@ -1183,19 +1191,24 @@ async fn send(
         }
     };
     let (keys, delivered) = match confidential {
-        Some((bucket_key, recipients)) => {
+        Some((bucket_key, internal_keys, secure_external, external)) => {
             let delivered = delivery::Delivered {
                 confidential: true,
-                recipients: recipients
+                recipients: internal_keys
                     .iter()
                     .map(delivery::RecipientReport::of)
                     .collect(),
+                secure_external: external,
             };
             match delivery::confidential_keys(
                 &bucket_key,
                 &mail_session_key,
                 &files,
-                recipients.into_iter().map(|key| key.key_data).collect(),
+                delivery::RecipientKeyData {
+                    internal: internal_keys.into_iter().map(|key| key.key_data).collect(),
+                    secure_external,
+                },
+                &sender_display_name,
                 &randomizer,
             ) {
                 Ok(keys) => (keys, delivered),
@@ -1219,35 +1232,61 @@ async fn send(
         )
         .await
     {
-        Ok(reply) => reply,
+        Ok(reply) => Some(reply),
         Err(error) => {
             let submit = transport::submit();
             diag::failed("send draft (SendDraftService post)", &error);
             diag::note(&format!("submit on the wire: {submit:?}"));
-            return match submit_outcome(submit) {
-                Ok(()) => {
-                    let marked = thread::mark_parent(&sdk, &mail, &thread).await;
-                    Ok(with_parent_mark(
-                        sent_reply(None, counts, Some(&delivered)),
-                        &thread,
-                        marked,
-                    ))
-                }
+            match submit_outcome(submit) {
+                Ok(()) => None,
                 // The server may still be sending it: leave the draft alone.
-                Err(code @ "send_uncertain") => Err(code),
+                Err(code @ "send_uncertain") => return Err(code),
                 Err(code) => {
                     cleanup_draft(sdk.clone(), &draft).await;
-                    Err(code)
+                    return Err(code);
                 }
-            };
+            }
         }
     };
+    // The mail went out; nothing below may fail the send.
     let marked = thread::mark_parent(&sdk, &mail, &thread).await;
-    Ok(with_parent_mark(
-        sent_reply(Some(&reply), counts, Some(&delivered)),
+    let named: Vec<&SendRecipient> = to.iter().chain(&cc).chain(&bcc).collect();
+    let contacts_saved =
+        save_sent_passwords(&sdk, &delivered.secure_external, &passwords, &named).await;
+    let mut result = with_parent_mark(
+        sent_reply(reply.as_ref(), counts, Some(&delivered)),
         &thread,
         marked,
-    ))
+    );
+    result["contacts_saved"] = json!(contacts_saved);
+    Ok(result)
+}
+
+/// Keep each password-protected recipient's password on their contact, as
+/// the official client's `SendMailModel.updateContacts` does, so Tuta's own
+/// apps offer it next time: a new contact (named from the recipient) where
+/// the address has none, an update where the contact holds another password.
+/// Whether every write went through; a failure never fails the sent mail.
+async fn save_sent_passwords(
+    sdk: &LoggedInSdk,
+    external: &[String],
+    passwords: &secure_external::Passwords,
+    named: &[&SendRecipient],
+) -> bool {
+    let entries: Vec<secure_external::ContactPassword> = external
+        .iter()
+        .filter_map(|address| {
+            Some(secure_external::ContactPassword {
+                address,
+                name: named
+                    .iter()
+                    .find(|r| r.address.eq_ignore_ascii_case(address))
+                    .map_or("", |r| r.name.as_str()),
+                password: passwords.get(address)?,
+            })
+        })
+        .collect();
+    secure_external::save(sdk, &entries).await.is_ok()
 }
 
 /// Each attachment file's session key, resolved from the server like the
@@ -1382,8 +1421,9 @@ async fn dispatch(request: Request) -> Result<Value> {
             reply_tos,
             subject,
             body_html,
-            delivery,
+            confidential,
             ordinary_confirmed,
+            passwords,
             attachments,
             in_reply_to,
             references,
@@ -1400,8 +1440,9 @@ async fn dispatch(request: Request) -> Result<Value> {
                 reply_tos,
                 subject,
                 body_html,
-                delivery,
+                confidential,
                 ordinary_confirmed,
+                passwords,
                 attachments,
                 thread,
             )
@@ -1419,6 +1460,10 @@ async fn dispatch(request: Request) -> Result<Value> {
         Operation::Delete(r) => mailbox_ops::delete_mails(&sdk, r).await,
         Operation::EmptyFolder(r) => mailbox_ops::empty_folder(&sdk, r).await,
         Operation::SaveDraft(r) => drafts::save_draft(&sdk, r).await,
+        Operation::ContactPasswords(r) => secure_external::contact_passwords(&sdk, r).await,
+        Operation::StoreContactPasswords(r) => {
+            secure_external::store_contact_passwords(&sdk, r).await
+        }
         Operation::DeleteDraft(r) => drafts::delete_draft(&sdk, r).await,
         Operation::Import(r) => import::import(&sdk, r).await,
         // A watch arrives here only without its newline or with stdin
@@ -1608,30 +1653,60 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"version":1,"op":"star"}"#).is_err());
     }
     #[test]
-    fn send_parses_its_delivery_choice() {
-        let request: Request = serde_json::from_str(
-            r#"{"version":1,"op":"send","session":{"login":"a@tuta.com","user_id":"u",
-            "access_token":"t","encrypted_passphrase_key":[]},
-            "sender":"a@tuta.com","sender_name":"A","to":[],"cc":[],"bcc":[],
-            "reply_tos":[],"subject":"s","body_html":"b","delivery":"ordinary",
-            "ordinary_confirmed":true,"attachments":[]}"#,
+    fn send_parses_its_confidentiality_and_passwords() {
+        let parse = |fields: &str| {
+            serde_json::from_str::<Request>(&format!(
+                r#"{{"version":1,"op":"send","session":{{"login":"a@tuta.com","user_id":"u",
+                "access_token":"t","encrypted_passphrase_key":[]}},
+                "sender":"a@tuta.com","sender_name":"A","to":[],"cc":[],"bcc":[],
+                "reply_tos":[],"subject":"s","body_html":"b",
+                "attachments":[]{fields}}}"#
+            ))
+        };
+        let request = parse(r#","confidential":false,"ordinary_confirmed":true"#).unwrap();
+        match request.operation {
+            Operation::Send {
+                confidential: false,
+                ordinary_confirmed: true,
+                passwords,
+                ..
+            } => assert_eq!(passwords.get("x@example.org"), None),
+            _ => panic!("not a send"),
+        }
+        let request = parse(
+            r#","confidential":true,"ordinary_confirmed":false,
+            "passwords":{"x@example.org":"pw"}"#,
         )
         .unwrap();
-        assert!(matches!(
-            request.operation,
+        match request.operation {
             Operation::Send {
-                delivery: Delivery::Ordinary,
-                ordinary_confirmed: true,
+                confidential: true,
+                passwords,
                 ..
-            }
-        ));
-        assert!(serde_json::from_str::<Request>(
-            r#"{"version":1,"op":"send","session":{"login":"a@tuta.com","user_id":"u",
-            "access_token":"t","encrypted_passphrase_key":[]},
-            "sender":"a@tuta.com","sender_name":"A","to":[],"cc":[],"bcc":[],
-            "reply_tos":[],"subject":"s","body_html":"b","delivery":"whenever",
-            "ordinary_confirmed":true,"attachments":[]}"#
-        )
+            } => assert_eq!(passwords.get("X@example.org"), Some("pw")),
+            _ => panic!("not a send"),
+        }
+        // The old delivery field is gone, and confidential has no default.
+        assert!(parse(r#","delivery":"ordinary","ordinary_confirmed":true"#).is_err());
+        assert!(parse(r#","ordinary_confirmed":true"#).is_err());
+        assert!(parse(r#","confidential":"yes","ordinary_confirmed":true"#).is_err());
+    }
+    #[test]
+    fn contact_password_operations_parse() {
+        let session = r#""session":{"login":"a@tuta.com","user_id":"u",
+            "access_token":"t","encrypted_passphrase_key":[]}"#;
+        for body in [
+            format!(r#"{{"version":1,"op":"contact_passwords",{session},"addresses":["x@y.z"]}}"#),
+            format!(
+                r#"{{"version":1,"op":"store_contact_passwords",{session},
+                "passwords":{{"x@y.z":"pw"}}}}"#
+            ),
+        ] {
+            assert!(serde_json::from_str::<Request>(&body).is_ok(), "{body}");
+        }
+        assert!(serde_json::from_str::<Request>(&format!(
+            r#"{{"version":1,"op":"contact_passwords",{session},"addresses":[],"extra":1}}"#
+        ))
         .is_err());
     }
     #[test]
@@ -1641,7 +1716,7 @@ mod tests {
                 r#"{{"version":1,"op":"send","session":{{"login":"a@tuta.com","user_id":"u",
                 "access_token":"t","encrypted_passphrase_key":[]}},
                 "sender":"a@tuta.com","sender_name":"A","to":[],"cc":[],"bcc":[],
-                "reply_tos":[],"subject":"s","body_html":"b","delivery":"ordinary",
+                "reply_tos":[],"subject":"s","body_html":"b","confidential":false,
                 "ordinary_confirmed":true,"attachments":[]{extra}}}"#
             ))
         };

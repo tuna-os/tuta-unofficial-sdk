@@ -34,3 +34,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # MIME parsing for `import`, the version and features the official desktop
 # importer (tutanota `src/app-kit/mimimi`) uses, so its conversion ports as is.
 mail-parser = { version = "0.10.2", features = ["full_encoding"] }
+# Holds recipient passwords of password-protected sends. Already in
+# Cargo.lock through the SDK (1.9.1), so this adds an edge, not a crate, and
+# cargo-sources.json is unchanged.
+zeroize = "1"

@@ -958,6 +958,7 @@ dependencies = [
  "tokio",
  "tuta-sdk",
  "tutabridge-tuta",
+ "zeroize",
 ]
 
 [[package]]

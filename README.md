@@ -43,6 +43,16 @@ The `upstream` submodule is used for source only:
     SDK's own whole-instance PUT would encrypt every value again, final ones
     such as a mail's subject included. It adds `PATCH` to the SDK's
     `HttpMethod` for it.
+  - `04-secure-external-recipient.patch` exposes
+    `LoggedInSdk::secure_external_recipient_key_data`, a port of the official
+    client's password-protected recipient path (`addRecipientKeyData`,
+    `getExternalGroupKeys`, `createExternalUser`): an Argon2id key from the
+    password, the external user found or created, the bucket key wrapped for
+    it. It refuses a shared-mailbox or external sender, as the official
+    client does. `ContactFacade` gains `create_contact` and
+    `set_preshared_password`, and `EntityClient::create_instance` reports a
+    refused create as an error instead of panicking. It adds no
+    cryptography.
 
   `prepare.sh` runs tutabridge's `sdk-prepare.py`, which prepares and
   verifies the pinned SDK in `upstream/sdk/generated`, then writes a copy with
@@ -80,7 +90,7 @@ Every request carries `version: 1` and an `op`:
 | `message` | `session`, compound `id` | Decrypted body, original headers, recipients and attachments; its header carries `message_id` too |
 | `mark_read` | `session`, `ids`, `is_read` | Per-id outcomes |
 | `move` | `session`, `ids`, compound `destination` | Per-id outcomes with `new_id` and `source` |
-| `send` | `session`, `sender`, `sender_name`, `to`, `cc`, `bcc`, `reply_tos`, `subject`, `body_html`, `attachments`, `delivery` (`"ordinary"` or `"secure"`), `ordinary_confirmed`, optional `in_reply_to`, `references`, `action` (see [Replies and forwards](#replies-and-forwards)) | Server ids of the sent mail, recipient counts, the delivery mode and each Tuta recipient's key; for a reply or forward, `parent_marked` |
+| `send` | `session`, `sender`, `sender_name`, `to`, `cc`, `bcc`, `reply_tos`, `subject`, `body_html`, `attachments`, `confidential` (bool), `ordinary_confirmed`, optional `passwords` (`{address: password}`), optional `in_reply_to`, `references`, `action` (see [Replies and forwards](#replies-and-forwards)) | Server ids of the sent mail, recipient counts, the delivery mode, each Tuta recipient's key, `secure_external` and `contacts_saved` (see [Delivery](#delivery)); for a reply or forward, `parent_marked` |
 | `revoke` | `session` | Empty object; closes the server-side session |
 | `list_labels` | `session` | `labels`: `{id, name, color}` each |
 | `create_folder` | `session`, `name`, optional compound `parent` | The new folder's `id` |
@@ -94,6 +104,8 @@ Every request carries `version: 1` and an `op`:
 | `empty_folder` | `session`, compound `id` of Trash or Spam | `deleted`: how many mails it held |
 | `save_draft` | `session`, optional compound `draft_id`, `sender`, `sender_name`, `to`, `cc`, `bcc`, `reply_tos`, `subject`, `body_html`, `confidential`, `attachments`, optional `in_reply_to`, `references`, `action` | The draft's `id` |
 | `delete_draft` | `session`, compound `id` | Empty object |
+| `contact_passwords` | `session`, `addresses` (at most 100) | `recipients`: `{address, external, password}` per distinct address, in request order (see [Delivery](#delivery)) |
+| `store_contact_passwords` | `session`, `passwords` (`{address: password}`, at most 100) | Empty object |
 | `import` | `session`, compound `folder`, `mime_base64` (the whole RFC 5322 message, standard base64), optional `unread` (default `false`) | The new mail's `id`, or null when the server had not listed it yet |
 | `watch` | `session` | A stream of event lines until stdin closes |
 
@@ -124,8 +136,14 @@ An error carries a fixed code, never SDK or server text:
   in `in_reply_to` or `references`, more than 100 references, or an `action`
   with no Message-ID).
 - Sending: `invalid_recipient`, `sender_unknown`, `recipient_not_found`,
-  `secure_external_unsupported`, `ordinary_delivery_requires_consent`,
-  `send_failed`, `send_uncertain`.
+  `password_required` (a confidential send has a recipient outside Tuta
+  without a password; no address is named),
+  `secure_external_sender_unsupported` (password-protected delivery from a
+  shared mailbox or an external user, which the official client refuses
+  too), `ordinary_delivery_requires_consent`, `send_failed`, `send_uncertain`.
+- Contacts: `contact_save_failed` when `store_contact_passwords` could not
+  write a contact, plus `invalid_batch` and `invalid_recipient` for the
+  address lists.
 - `revoke_failed` when the server would not close a session.
 - Folders and labels: `folder_not_found`, `folder_exists` (a sibling has the
   name, ignoring case), `not_custom_folder` (system folders are never
@@ -236,37 +254,71 @@ Lines name folders only, never a mail's content.
 
 ### Delivery
 
-A send goes out in one of two modes, decided from its recipients before
-anything is written on the server (no blob, no draft):
+A send goes out in one of two modes, decided from its recipients and
+`confidential` before anything is written on the server (no blob, no draft).
+A recipient is on Tuta (internal) when its domain is Tuta's or the public-key
+service knows the address, and outside Tuta (external) when the service
+answers 404. This is the official client's own rule
+(`SendMailModel.isConfidential()` is `confidential ||
+!containsExternalRecipients()`):
 
-- **Confidential** (end-to-end encrypted) when every recipient is on Tuta: a
-  Tuta domain, or an address the public-key service knows. This is the
-  official client's own rule (`SendMailModel.isConfidential()`), so it needs
-  no consent and applies to `delivery: "ordinary"` too. A fresh bucket key is
-  encrypted for each recipient's current public key inside the SDK; the
-  mail's and attachments' session keys are wrapped with the bucket key, the
-  draft is marked confidential, and an all-TutaCrypt send also carries its
-  `TutacryptSender` authentication status. A Tuta recipient without a key
-  fails the whole send with `recipient_not_found`; it is never downgraded.
-- **Ordinary** (encrypted in transit, not end to end) for everyone when any
-  recipient is outside Tuta, only with `delivery: "ordinary"` and
-  `ordinary_confirmed: true` (`ordinary_delivery_requires_consent`
-  otherwise). `delivery: "secure"` with a recipient outside Tuta needs a
-  password-protected secure-external delivery, which the helper does not
-  offer: `secure_external_unsupported`.
+| Recipients | `confidential: true` | `confidential: false` |
+| --- | --- | --- |
+| All on Tuta | Confidential | Confidential, no consent needed |
+| Some or all outside Tuta | Confidential: Tuta recipients by key, the others password-protected; `password_required` unless every one has a password | Ordinary for everyone with `ordinary_confirmed: true`, else `ordinary_delivery_requires_consent` |
 
-If no recipient is outside Tuta but a key lookup failed, the mode cannot be
-decided and the send fails with the lookup's code (`transport_failed` or
-`send_failed`). The helper never falls back to SMTP and never quietly drops
-encryption.
+- **Confidential** (end-to-end encrypted). A fresh bucket key wraps the
+  mail's and attachments' session keys, and the draft is marked
+  confidential. Inside the SDK the bucket key is encrypted for each Tuta
+  recipient's current public key; a Tuta recipient without a key fails the
+  whole send with `recipient_not_found`, never downgraded. Each recipient
+  outside Tuta gets the bucket key behind their password: an Argon2id key
+  over a fresh salt opens the account's external user for that address,
+  which the SDK creates on the first password-protected send to it, and Tuta
+  mails the recipient a link to read the message in Tuta's web app. Such a
+  send carries the sender's name in the clear for that notification, as the
+  official client does. A send whose recipients are all on Tuta with
+  TutaCrypt keys also carries its `TutacryptSender` authentication status;
+  any password-protected recipient rules that out, as in the official
+  client.
+- **Ordinary** (encrypted in transit, not end to end) for everyone, only with
+  `ordinary_confirmed: true`. Passwords are ignored.
 
-The result carries `confidential` (bool) and `recipients`: for a
-confidential send one `{address, key_version, protocol, fingerprint}` per
-distinct recipient, where `protocol` is `tuta_crypt` or `rsa` and
-`fingerprint` is the hex SHA-256 over the public key it was encrypted with
-(each of RSA, X25519 and Kyber component as the public-key service serves
-it, length-prefixed as a big-endian u32); an empty list for an ordinary one.
-Key bytes are never reported.
+Passwords are trimmed, and addresses match ignoring case. A blank password is
+a missing one. A password-protected send from a shared mailbox or by an
+external user is `secure_external_sender_unsupported`, as in the official
+client.
+
+If a key lookup failed and the mode or a recipient's key depends on it, the
+send fails with the lookup's code (`transport_failed` or `send_failed`); an
+ordinary send with a recipient outside Tuta goes regardless. The helper
+never falls back to SMTP and never quietly drops encryption.
+
+The result carries `confidential` (bool), `recipients`, `secure_external` and
+`contacts_saved`. `recipients` lists, for a confidential send, one `{address,
+key_version, protocol, fingerprint}` per distinct Tuta recipient, where
+`protocol` is `tuta_crypt` or `rsa` and `fingerprint` is the hex SHA-256 over
+the public key it was encrypted with (each of RSA, X25519 and Kyber component
+as the public-key service serves it, length-prefixed as a big-endian u32);
+it is empty for an ordinary send. Key bytes are never reported.
+`secure_external` lists the addresses that got the mail password-protected.
+
+After a password-protected send went out, each recipient's password is kept
+on their contact's `presharedPassword`, as the official client's
+`SendMailModel.updateContacts` keeps it, so Tuta's own apps offer it next
+time: a contact holding another password is updated (a PATCH of that field
+alone), and an address without a contact gets a new one, named from the
+recipient's name or address. `contacts_saved` is false when a write failed;
+the mail has gone out either way. The fields are null when a run overran
+after the submit.
+
+`contact_passwords` lets a composer fill passwords in: per distinct address,
+`external` (true outside Tuta, false on Tuta, null when the lookup failed)
+and `password`, the one its contact keeps (null on Tuta or when none is
+kept). `store_contact_passwords` keeps passwords on contacts the same way
+without sending, for a send that is queued for later; blank ones are skipped,
+never cleared. Passwords travel only in requests and replies on the private
+pipe: never in diagnostics.
 
 Keys are not verified. The official client only refuses a key that differs
 from one the user verified by hand (`KeyVerificationMismatchError`); Hylki
@@ -358,20 +410,32 @@ With `HYLKI_TUTA_DEBUG=1` in its environment, the helper writes diagnostics to
 stderr, each line prefixed `hylki-tuta:`: every HTTP request as method, service
 path and status (no host, query, body or ids), and the Debug form of every SDK
 error with the stage it broke in (sign-in, recipient resolution, recipient
-keys, blob upload, draft create, draft load, attachment keys, send draft,
-draft cleanup, the parent's reply mark, folder and label services, deletes,
-the event bus).
-Addresses, ids, tokens and key bytes are redacted, and no message content is
-printed. Hylki discards the helper's stderr, so run the helper by hand to see
-it.
+keys, secure external keys, blob upload, draft create, draft load, attachment
+keys, send draft, draft cleanup, the parent's reply mark, contact load,
+contact create, contact password, folder and label services, deletes, the
+event bus).
+Addresses, ids, tokens and key bytes are redacted, and no message content or
+password is printed. Hylki discards the helper's stderr, so run the helper by
+hand to see it.
 
 ## Known limits
 
 - Two-factor sign-in supports TOTP only; U2F and WebAuthn keys are not
   supported.
-- Confidential mail goes to Tuta recipients only: password-protected
-  delivery to other providers (secure external recipients) is not
-  supported, and recipient keys are not verified (see Delivery).
+- Recipient keys are not verified (see Delivery).
+- Password-protected delivery is the official client's, with three
+  differences. The notification to the recipient is always in English (the
+  official composer lets the sender choose its language). A contact that
+  another Tuta app stored with AEAD encryption cannot be written, so its
+  password is not updated (`contacts_saved` false). And a new contact is
+  created only for a password-protected recipient, never for other
+  recipients, which the official client also stores unless the account
+  turned automatic contacts off.
+- The first password-protected send to an address creates an external user
+  for it on the server, and the helper offers no way to remove one. A later
+  send to that address uses it again.
+- Password-protected delivery is refused from a shared mailbox and for an
+  external (secure-mail) user, as in the official client.
 - Stars are not stored on the server.
 - Importing (`import`) needs a Legend or Unlimited plan, as in Tuta's own
   app; on any other plan it is refused before anything is written.
