@@ -1,0 +1,1458 @@
+Expose password-protected external recipients and contact writes (Hylki)
+
+Confidential mail to a recipient outside Tuta goes through an external user
+the sender's account owns, unlocked by a passphrase shared out of band. TS
+builds it in MailFacade.addRecipientKeyData (getExternalGroupKeys,
+createExternalUser); the SDK has the entities and the ExternalUserService but
+no code for it, and the KeyLoaderFacade and UserFacade it needs are private.
+
+This adds crypto::secure_external_facade::SecureExternalFacade, a port of
+that arm: an Argon2id passphrase key over a fresh 16-byte salt, the verifier
+sha256(key), saltHash sha256(salt), the external user looked up through
+GroupRoot.externalUserReferences (keyed by the trimmed, lower-cased address)
+and its group keys unwrapped with the user group key at the recorded admin
+version (KeyLoaderFacade.load_sym_group_key), or a new external user posted
+to the ExternalUserService with fresh keys wrapped as TS wraps them; then
+ownerEncBucketKey under the external mail group key and
+pwEncCommunicationKey under the passphrase key. An external sender, a shared
+mailbox and any recipient without a passphrase are refused before anything
+is loaded, as in TS. LoggedInSdk keeps the facade and exposes the call.
+
+ContactFacade gains create_contact (a new contact in the user's contact list,
+under a fresh session key wrapped with the contact group key, as TS
+EntityClient.setup with the AES-CBC scheme) and set_preshared_password (a
+PATCH of presharedPassword alone under the contact's session key, as TS
+SendMailModel.updateContacts writes it); an AEAD contact is refused, since
+the SDK writes no AEAD values. EntityClient.create_instance returns the
+server's HttpError for a non-2xx status instead of panicking. No new
+cryptography: only existing SDK primitives are composed.
+
+diff --git a/tuta-sdk/rust/sdk/src/contacts/contact_facade.rs b/tuta-sdk/rust/sdk/src/contacts/contact_facade.rs
+index c7f592f..70225bf 100644
+--- a/tuta-sdk/rust/sdk/src/contacts/contact_facade.rs
++++ b/tuta-sdk/rust/sdk/src/contacts/contact_facade.rs
+@@ -1,19 +1,33 @@
+ #[cfg_attr(test, mockall_double::double)]
+ use crate::crypto_entity_client::CryptoEntityClient;
+-use crate::entities::generated::sys::RootInstance;
++use crate::entities::generated::sys::{Patch, PatchList, RootInstance};
+ use crate::entities::generated::tutanota::ContactList;
+ use crate::entities::Entity;
++use crate::groups::GroupType;
++#[cfg_attr(test, mockall_double::double)]
++use crate::key_loader_facade::KeyLoaderFacade;
+ use crate::type_model_provider::TypeModelProvider;
+ #[cfg_attr(test, mockall_double::double)]
+ use crate::user_facade::UserFacade;
++use crate::util::{convert_version_to_i64, convert_version_to_u64};
+ use crate::{entities::generated::tutanota::Contact, GeneratedId};
+-use crate::{ApiCallError, Arc, IdTupleCustom, ListLoadDirection};
++use crate::{ApiCallError, Arc, CustomId, IdTupleCustom, IdTupleGenerated, ListLoadDirection};
++use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
++use base64::Engine;
++use crypto_primitives::aes::{Aes256Key, InitializationVector};
++use crypto_primitives::key::GenericAesKey;
++use crypto_primitives::randomizer_facade::RandomizerFacade;
++
++/// TS `PatchOperationType.REPLACE_VALUE`.
++const PATCH_REPLACE: i64 = 2;
+ 
+ #[derive(uniffi::Object)]
+ pub struct ContactFacade {
+ 	crypto_entity_client: Arc<CryptoEntityClient>,
+ 	type_model_provider: Arc<TypeModelProvider>,
+ 	user_facade: Arc<UserFacade>,
++	key_loader_facade: Arc<KeyLoaderFacade>,
++	randomizer_facade: RandomizerFacade,
+ }
+ 
+ #[cfg_attr(test, mockall::automock)]
+@@ -23,11 +37,15 @@ impl ContactFacade {
+ 		crypto_entity_client: Arc<CryptoEntityClient>,
+ 		type_model_provider: Arc<TypeModelProvider>,
+ 		user_facade: Arc<UserFacade>,
++		key_loader_facade: Arc<KeyLoaderFacade>,
++		randomizer_facade: RandomizerFacade,
+ 	) -> Self {
+ 		ContactFacade {
+ 			crypto_entity_client,
+ 			type_model_provider,
+ 			user_facade,
++			key_loader_facade,
++			randomizer_facade,
+ 		}
+ 	}
+ 
+@@ -78,21 +96,344 @@ impl ContactFacade {
+ 
+ 		Ok(contacts)
+ 	}
++
++	/// Stores `contact` as a new contact in the user's contact list, as TS
++	/// `EntityClient.setup(contactListId, contact)` does with the AES-CBC
++	/// scheme: a fresh session key, wrapped with the contact group's current
++	/// key, encrypts the contact. Its id, permissions and owner fields are
++	/// set here. Returns the new contact's id.
++	pub async fn create_contact(&self, contact: Contact) -> Result<IdTupleGenerated, ApiCallError> {
++		let mut contact = contact;
++		let contact_list = self.fetch_contact_lists().await?;
++		let contact_group_id = self
++			.user_facade
++			.get_membership_by_group_type(GroupType::Contact)?
++			.group;
++		let group_key = self
++			.key_loader_facade
++			.get_current_sym_group_key(&contact_group_id)
++			.await
++			.map_err(|error| ApiCallError::internal_with_err(error, "contact group key"))?;
++		let session_key = GenericAesKey::Aes256(Aes256Key::generate(&self.randomizer_facade));
++		let owner_enc_session_key = group_key.encrypt_key(
++			&session_key,
++			InitializationVector::generate(&self.randomizer_facade),
++		);
++		// A POST names only the list; the server assigns the element id.
++		contact._id = Some(IdTupleGenerated::new(
++			contact_list.contacts.clone(),
++			GeneratedId::min_id(),
++		));
++		contact._permissions = GeneratedId::min_id();
++		contact._format = 0;
++		contact._ownerGroup = Some(contact_group_id);
++		contact._ownerEncSessionKey = Some(owner_enc_session_key.object);
++		contact._ownerKeyVersion = Some(convert_version_to_i64(owner_enc_session_key.version));
++		contact._kdfNonce = None;
++		let created = self
++			.crypto_entity_client
++			.create_instance(contact, Some(session_key))
++			.await?;
++		let element_id = created.generatedId.ok_or_else(|| {
++			ApiCallError::internal("the server returned no id for the contact".to_string())
++		})?;
++		Ok(IdTupleGenerated::new(contact_list.contacts, element_id))
++	}
++
++	/// Replaces a stored contact's `presharedPassword` alone, as the PATCH TS
++	/// `EntityClient.update` sends after `SendMailModel.updateContacts`
++	/// changed it. The value is encrypted with the contact's own session key,
++	/// unwrapped from its owner key. A contact written with AEAD (it carries
++	/// a KDF nonce) is refused: this SDK writes no AEAD values.
++	pub async fn set_preshared_password(
++		&self,
++		contact: &Contact,
++		password: &str,
++	) -> Result<(), ApiCallError> {
++		if contact._kdfNonce.is_some() {
++			return Err(ApiCallError::internal(
++				"AEAD instance writes are not supported".to_string(),
++			));
++		}
++		let id = contact
++			._id
++			.as_ref()
++			.ok_or_else(|| ApiCallError::internal("contact without an id".to_string()))?;
++		let (Some(owner_group), Some(owner_enc_session_key)) =
++			(&contact._ownerGroup, &contact._ownerEncSessionKey)
++		else {
++			return Err(ApiCallError::internal(
++				"contact without an owner key".to_string(),
++			));
++		};
++		let owner_key = self
++			.key_loader_facade
++			.load_sym_group_key(
++				owner_group,
++				convert_version_to_u64(contact._ownerKeyVersion.unwrap_or(0)),
++				None,
++			)
++			.await
++			.map_err(|error| ApiCallError::internal_with_err(error, "contact owner key"))?;
++		let session_key = owner_key
++			.decrypt_aes_key(owner_enc_session_key)
++			.map_err(|error| ApiCallError::internal_with_err(error, "contact session key"))?;
++		let encrypted = session_key
++			.encrypt_data(
++				password.as_bytes(),
++				InitializationVector::generate(&self.randomizer_facade),
++			)
++			.map_err(|error| ApiCallError::internal_with_err(error, "contact password"))?;
++		let attribute_path = self
++			.type_model_provider
++			.resolve_client_type_ref(&Contact::type_ref())
++			.and_then(|model| {
++				model
++					.get_attribute_id_by_attribute_name("presharedPassword")
++					.ok()
++			})
++			.ok_or_else(|| ApiCallError::internal("no presharedPassword attribute".to_string()))?;
++		let patches = PatchList {
++			_id: Some(self.aggregate_id()),
++			patches: vec![Patch {
++				_id: Some(self.aggregate_id()),
++				patchOperation: PATCH_REPLACE,
++				attributePath: attribute_path,
++				value: Some(BASE64_STANDARD.encode(encrypted)),
++			}],
++		};
++		self.crypto_entity_client
++			.patch_instance::<Contact>(id, patches)
++			.await
++	}
++
++	/// A PatchList is not encrypted, so nothing fills its aggregate ids in.
++	fn aggregate_id(&self) -> CustomId {
++		CustomId(BASE64_URL_SAFE_NO_PAD.encode(self.randomizer_facade.generate_random_array::<4>()))
++	}
+ }
+ 
+ #[cfg(test)]
+ mod contact_facade_integration_tests {
+ 	use super::ContactFacade;
+ 	use crate::crypto_entity_client::MockCryptoEntityClient;
++	use crate::entities::generated::base::PersistenceResourcePostReturn;
++	use crate::entities::generated::sys::PatchList;
+ 	use crate::entities::generated::sys::{GroupMembership, RootInstance, User};
+ 	use crate::entities::generated::tutanota::{Contact, ContactList};
++	use crate::key_loader_facade::MockKeyLoaderFacade;
+ 	use crate::tutanota_constants::GroupType;
+ 	use crate::user_facade::MockUserFacade;
+ 	use crate::util::test_utils::{
+ 		create_mock_contact, create_test_entity, mock_type_model_provider,
+ 	};
+-	use crate::{Arc, CustomId, GeneratedId, IdTupleCustom, ListLoadDirection};
++	use crate::{Arc, CustomId, GeneratedId, IdTupleCustom, IdTupleGenerated, ListLoadDirection};
++	use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
++	use base64::Engine;
++	use crypto_primitives::aes::{Aes256Key, InitializationVector};
++	use crypto_primitives::key::GenericAesKey;
++	use crypto_primitives::randomizer_facade::test_util::make_thread_rng_facade;
++	use crypto_primitives::versioned::VersionedAesKey;
+ 	use mockall::predicate;
++	use std::sync::Mutex;
++
++	fn random_key() -> GenericAesKey {
++		GenericAesKey::Aes256(Aes256Key::generate(&make_thread_rng_facade()))
++	}
++
++	#[tokio::test]
++	async fn a_new_contact_is_owned_by_the_contact_group_under_a_fresh_session_key() {
++		let user_group = GeneratedId::test_random();
++		let contact_group = GeneratedId::test_random();
++		let contact_list_id = GeneratedId::test_random();
++		let contacts_list = GeneratedId::test_random();
++		let group_key = VersionedAesKey::new(random_key(), 5);
++
++		let mut user_facade = MockUserFacade::default();
++		user_facade
++			.expect_get_user_group_id()
++			.return_const(user_group.clone());
++		let membership_group = contact_group.clone();
++		user_facade
++			.expect_get_membership_by_group_type()
++			.withf(|group_type| *group_type == super::GroupType::Contact)
++			.returning(move |_| {
++				Ok(GroupMembership {
++					group: membership_group.clone(),
++					..create_test_entity()
++				})
++			});
++		let mut entities = MockCryptoEntityClient::default();
++		let contact_list_root = CustomId("CHR1dGFub3RhAACZ".to_string());
++		entities
++			.expect_load::<RootInstance, IdTupleCustom>()
++			.with(predicate::eq(IdTupleCustom::new(
++				user_group.clone(),
++				contact_list_root,
++			)))
++			.return_const(Ok(RootInstance {
++				reference: contact_list_id.clone(),
++				..create_test_entity()
++			}));
++		entities
++			.expect_load::<ContactList, GeneratedId>()
++			.with(predicate::eq(contact_list_id))
++			.return_const(Ok(ContactList {
++				contacts: contacts_list.clone(),
++				..create_test_entity()
++			}));
++		let created: Arc<Mutex<Option<(Contact, GenericAesKey)>>> = Arc::default();
++		let new_id = GeneratedId::test_random();
++		entities.expect_create_instance::<Contact>().returning({
++			let created = created.clone();
++			let new_id = new_id.clone();
++			move |contact, key| {
++				*created.lock().unwrap() = Some((contact, key.unwrap()));
++				Ok(PersistenceResourcePostReturn {
++					generatedId: Some(new_id.clone()),
++					..create_test_entity()
++				})
++			}
++		});
++		let mut key_loader_facade = MockKeyLoaderFacade::default();
++		let current_key = group_key.clone();
++		key_loader_facade
++			.expect_get_current_sym_group_key()
++			.with(predicate::eq(contact_group.clone()))
++			.returning(move |_| Ok(current_key.clone()));
++		let facade = ContactFacade {
++			crypto_entity_client: Arc::new(entities),
++			type_model_provider: Arc::new(mock_type_model_provider()),
++			user_facade: Arc::new(user_facade),
++			key_loader_facade: Arc::new(key_loader_facade),
++			randomizer_facade: make_thread_rng_facade(),
++		};
++
++		let id = facade
++			.create_contact(Contact {
++				firstName: "Ada".to_string(),
++				presharedPassword: Some("secret".to_string()),
++				..create_test_entity()
++			})
++			.await
++			.unwrap();
++
++		assert_eq!(id, IdTupleGenerated::new(contacts_list.clone(), new_id));
++		let (contact, session_key) = created.lock().unwrap().take().unwrap();
++		assert_eq!(contact._id.unwrap().list_id, contacts_list);
++		assert_eq!(contact._ownerGroup, Some(contact_group));
++		assert_eq!(contact._ownerKeyVersion, Some(5));
++		assert_eq!(
++			group_key
++				.object
++				.decrypt_aes_key(&contact._ownerEncSessionKey.unwrap())
++				.unwrap(),
++			session_key
++		);
++		assert_eq!(contact.presharedPassword.as_deref(), Some("secret"));
++		assert_eq!(contact.firstName, "Ada");
++	}
++
++	fn stored_contact(
++		group: &GeneratedId,
++		group_key: &GenericAesKey,
++		session_key: &GenericAesKey,
++	) -> Contact {
++		Contact {
++			_id: Some(IdTupleGenerated::new(
++				GeneratedId::test_random(),
++				GeneratedId::test_random(),
++			)),
++			_ownerGroup: Some(group.clone()),
++			_ownerEncSessionKey: Some(group_key.encrypt_key(
++				session_key,
++				InitializationVector::generate(&make_thread_rng_facade()),
++			)),
++			_ownerKeyVersion: Some(1),
++			_kdfNonce: None,
++			..create_test_entity()
++		}
++	}
++
++	#[tokio::test]
++	async fn a_changed_password_is_patched_alone_under_the_contact_session_key() {
++		let group = GeneratedId::test_random();
++		let group_key = random_key();
++		let session_key = random_key();
++		let contact = stored_contact(&group, &group_key, &session_key);
++		let mut key_loader_facade = MockKeyLoaderFacade::default();
++		let owner_key = group_key.clone();
++		key_loader_facade
++			.expect_load_sym_group_key()
++			.withf({
++				let group = group.clone();
++				move |id, version, current| *id == group && *version == 1 && current.is_none()
++			})
++			.returning(move |_, _, _| Ok(owner_key.clone()));
++		let patched: Arc<Mutex<Option<(IdTupleGenerated, PatchList)>>> = Arc::default();
++		let mut entities = MockCryptoEntityClient::default();
++		entities.expect_patch_instance::<Contact>().returning({
++			let patched = patched.clone();
++			move |id, patches| {
++				*patched.lock().unwrap() = Some((id.clone(), patches));
++				Ok(())
++			}
++		});
++		let facade = ContactFacade {
++			crypto_entity_client: Arc::new(entities),
++			type_model_provider: Arc::new(mock_type_model_provider()),
++			user_facade: Arc::new(MockUserFacade::default()),
++			key_loader_facade: Arc::new(key_loader_facade),
++			randomizer_facade: make_thread_rng_facade(),
++		};
++
++		facade
++			.set_preshared_password(&contact, "new secret")
++			.await
++			.unwrap();
++
++		let (id, patches) = patched.lock().unwrap().take().unwrap();
++		assert_eq!(Some(id), contact._id);
++		assert_eq!(patches.patches.len(), 1);
++		let patch = &patches.patches[0];
++		assert_eq!(patch.patchOperation, 2);
++		assert_eq!(patch.attributePath, "79");
++		let ciphertext = BASE64_STANDARD
++			.decode(patch.value.as_ref().unwrap())
++			.unwrap();
++		assert_eq!(
++			session_key.decrypt_data(&ciphertext).unwrap(),
++			b"new secret"
++		);
++		for id in [&patches._id, &patch._id] {
++			let id = id.as_ref().unwrap();
++			assert_eq!(BASE64_URL_SAFE_NO_PAD.decode(id.as_str()).unwrap().len(), 4);
++		}
++	}
++
++	#[tokio::test]
++	async fn an_aead_contact_is_not_written() {
++		let group = GeneratedId::test_random();
++		let contact = Contact {
++			_kdfNonce: Some(vec![7; 32]),
++			..stored_contact(&group, &random_key(), &random_key())
++		};
++		let mut key_loader_facade = MockKeyLoaderFacade::default();
++		key_loader_facade.expect_load_sym_group_key().never();
++		let mut entities = MockCryptoEntityClient::default();
++		entities.expect_patch_instance::<Contact>().never();
++		let facade = ContactFacade {
++			crypto_entity_client: Arc::new(entities),
++			type_model_provider: Arc::new(mock_type_model_provider()),
++			user_facade: Arc::new(MockUserFacade::default()),
++			key_loader_facade: Arc::new(key_loader_facade),
++			randomizer_facade: make_thread_rng_facade(),
++		};
++		assert!(facade
++			.set_preshared_password(&contact, "secret")
++			.await
++			.is_err());
++	}
+ 
+ 	fn create_mock_user(
+ 		user_group: &GeneratedId,
+@@ -168,6 +509,8 @@ mod contact_facade_integration_tests {
+ 			crypto_entity_client: Arc::new(mock_crypto_entity_client),
+ 			type_model_provider: Arc::new(mock_type_model_provider),
+ 			user_facade: Arc::new(mock_user_facade),
++			key_loader_facade: Arc::new(MockKeyLoaderFacade::default()),
++			randomizer_facade: make_thread_rng_facade(),
+ 		};
+ 
+ 		let loaded_contact_list = contact_facade.fetch_contact_lists().await;
+@@ -221,6 +564,8 @@ mod contact_facade_integration_tests {
+ 			crypto_entity_client: Arc::new(mock_crypto_entity_client),
+ 			type_model_provider: Arc::new(mock_type_model_provider),
+ 			user_facade: Arc::new(mock_user_facade),
++			key_loader_facade: Arc::new(MockKeyLoaderFacade::default()),
++			randomizer_facade: make_thread_rng_facade(),
+ 		};
+ 
+ 		let contacts = contact_facade.fetch_contacts(&contact_list_id).await;
+diff --git a/tuta-sdk/rust/sdk/src/crypto.rs b/tuta-sdk/rust/sdk/src/crypto.rs
+index 3bab62a..8e54ecb 100644
+--- a/tuta-sdk/rust/sdk/src/crypto.rs
++++ b/tuta-sdk/rust/sdk/src/crypto.rs
+@@ -25,6 +25,7 @@ mod tuta_crypt;
+ 
+ pub mod asymmetric_crypto_facade;
+ pub mod public_key_provider;
++pub mod secure_external_facade;
+ 
+ pub mod crypto_facade;
+ pub mod key;
+diff --git a/tuta-sdk/rust/sdk/src/crypto/secure_external_facade.rs b/tuta-sdk/rust/sdk/src/crypto/secure_external_facade.rs
+new file mode 100644
+index 0000000..de433be
+--- /dev/null
++++ b/tuta-sdk/rust/sdk/src/crypto/secure_external_facade.rs
+@@ -0,0 +1,883 @@
++//! Password-protected ("secure external") recipients of a confidential mail:
++//! the external-recipient arm of TS `MailFacade.addRecipientKeyData`, with
++//! `getExternalGroupKeys` and `createExternalUser`.
++//!
++//! A recipient outside Tuta reads a confidential mail through an external
++//! user that the sender's account owns. The user's group keys are wrapped
++//! with the sender's user group key, so only the sender's account can find
++//! them again, and with a key derived from a passphrase the sender shares
++//! with the recipient out of band. Each mail carries a fresh salt, the
++//! passphrase verifier and the external user group key under the passphrase
++//! key, plus the bucket key under the external mail group key.
++
++use crate::crypto::argon2_id::generate_key_from_passphrase;
++use crate::crypto::key::KeyLoadError;
++use crate::crypto::sha256;
++use crate::entities::generated::sys::{
++	ExternalUserReference, Group, GroupRoot, RootInstance, User,
++};
++use crate::entities::generated::tutanota::{
++	CreateExternalUserGroupData, ExternalUserData, SecureExternalRecipientKeyData,
++};
++use crate::entities::Entity;
++use crate::groups::GroupType;
++#[cfg_attr(test, mockall_double::double)]
++use crate::key_loader_facade::KeyLoaderFacade;
++use crate::login::login_facade::KdfType;
++use crate::rest_error::HttpError;
++use crate::services::generated::tutanota::ExternalUserService;
++#[cfg_attr(test, mockall_double::double)]
++use crate::services::service_executor::ServiceExecutor;
++use crate::services::ExtraServiceParams;
++use crate::tutanota_constants::AccountType;
++use crate::type_model_provider::TypeModelProvider;
++#[cfg_attr(test, mockall_double::double)]
++use crate::typed_entity_client::TypedEntityClient;
++#[cfg_attr(test, mockall_double::double)]
++use crate::user_facade::UserFacade;
++use crate::util::convert_version_to_i64;
++use crate::{ApiCallError, CustomId, GeneratedId, IdTupleCustom};
++use base64::prelude::BASE64_URL_SAFE_NO_PAD;
++use base64::Engine;
++use crypto_primitives::aes::{Aes256Key, AesEncryptError, InitializationVector};
++use crypto_primitives::key::{GenericAesKey, KeyDecryptError};
++use crypto_primitives::randomizer_facade::RandomizerFacade;
++use crypto_primitives::versioned::VersionedAesKey;
++use std::sync::Arc;
++
++/// One password-protected recipient: the address as the mail names it and
++/// the passphrase the sender shares with them.
++pub struct SecureExternalRecipient<'a> {
++	pub mail_address: &'a str,
++	pub passphrase: &'a str,
++}
++
++#[derive(thiserror::Error, Debug)]
++pub enum SecureExternalRecipientError {
++	/// These recipients have no passphrase. TS collects them with the
++	/// not-found recipients; no key data is built for anyone then.
++	#[error("recipients without a passphrase")]
++	MissingPassphrase(Vec<String>),
++	/// An external (secure-mail) user cannot provision further external
++	/// users.
++	#[error("external sender")]
++	ExternalSender,
++	/// TS refuses secure external recipients from a shared mailbox: the
++	/// external user would hang off the sender's own user group.
++	#[error("shared mailbox sender")]
++	SharedMailboxSender,
++	/// The external user's stored groups are not what TS creates.
++	#[error("malformed external user: {0}")]
++	MalformedExternalUser(&'static str),
++	#[error("api call failed")]
++	ApiCall(#[from] ApiCallError),
++	#[error("key loading failed")]
++	KeyLoad(#[from] KeyLoadError),
++	#[error("key decryption failed")]
++	KeyDecrypt(#[from] KeyDecryptError),
++	#[error("encryption failed")]
++	AesEncrypt(#[from] AesEncryptError),
++}
++
++/// The external user's current keys, as `getExternalGroupKeys` returns them.
++struct ExternalGroupKeys {
++	user_group_key: VersionedAesKey,
++	mail_group_key: VersionedAesKey,
++}
++
++pub struct SecureExternalFacade {
++	user_facade: Arc<UserFacade>,
++	key_loader_facade: Arc<KeyLoaderFacade>,
++	typed_entity_client: Arc<TypedEntityClient>,
++	service_executor: Arc<ServiceExecutor>,
++	type_model_provider: Arc<TypeModelProvider>,
++	randomizer_facade: RandomizerFacade,
++}
++
++impl SecureExternalFacade {
++	#[must_use]
++	pub fn new(
++		user_facade: Arc<UserFacade>,
++		key_loader_facade: Arc<KeyLoaderFacade>,
++		typed_entity_client: Arc<TypedEntityClient>,
++		service_executor: Arc<ServiceExecutor>,
++		type_model_provider: Arc<TypeModelProvider>,
++		randomizer_facade: RandomizerFacade,
++	) -> Self {
++		Self {
++			user_facade,
++			key_loader_facade,
++			typed_entity_client,
++			service_executor,
++			type_model_provider,
++			randomizer_facade,
++		}
++	}
++
++	/// Builds `SendDraftData.secureExternalRecipientKeyData` for each
++	/// recipient (the caller assigns the aggregate `_id`), creating the
++	/// external user first where the account has none for that address.
++	///
++	/// Refused, before anything is loaded or created, for an external user
++	/// and for a shared mailbox (`sender_mail_group_id` other than the user's
++	/// own mail group), as TS refuses both, and when any recipient lacks a
++	/// passphrase. The passphrase key is Argon2id (TS `DEFAULT_KDF_TYPE`) over
++	/// a fresh 16-byte salt.
++	pub async fn secure_external_recipient_key_data(
++		&self,
++		sender_mail_group_id: &GeneratedId,
++		bucket_key: &GenericAesKey,
++		recipients: &[SecureExternalRecipient<'_>],
++	) -> Result<Vec<SecureExternalRecipientKeyData>, SecureExternalRecipientError> {
++		if self.user_facade.get_user().accountType == AccountType::EXTERNAL as i64 {
++			return Err(SecureExternalRecipientError::ExternalSender);
++		}
++		let own_mail_group_id = self
++			.user_facade
++			.get_membership_by_group_type(GroupType::Mail)?
++			.group;
++		if own_mail_group_id != *sender_mail_group_id {
++			return Err(SecureExternalRecipientError::SharedMailboxSender);
++		}
++		let missing: Vec<String> = recipients
++			.iter()
++			.filter(|recipient| recipient.passphrase.is_empty())
++			.map(|recipient| recipient.mail_address.to_string())
++			.collect();
++		if !missing.is_empty() {
++			return Err(SecureExternalRecipientError::MissingPassphrase(missing));
++		}
++
++		let mut key_data = Vec::with_capacity(recipients.len());
++		for recipient in recipients {
++			let salt: [u8; 16] = self.randomizer_facade.generate_random_array();
++			let passphrase_key =
++				GenericAesKey::Aes256(generate_key_from_passphrase(recipient.passphrase, salt));
++			// TS `createAuthVerifier`: the raw hash, not its base64url form.
++			let verifier = sha256(passphrase_key.as_bytes());
++			let external_keys = self
++				.external_group_keys(recipient.mail_address, &passphrase_key, &verifier)
++				.await?;
++			let owner_enc_bucket_key = external_keys
++				.mail_group_key
++				.encrypt_key(bucket_key, self.iv());
++			let pw_enc_communication_key =
++				passphrase_key.encrypt_key(&external_keys.user_group_key.object, self.iv());
++			key_data.push(SecureExternalRecipientKeyData {
++				_id: None,
++				mailAddress: recipient.mail_address.to_string(),
++				passwordVerifier: verifier,
++				salt: Some(salt.to_vec()),
++				saltHash: Some(sha256(&salt)),
++				pwEncCommunicationKey: Some(pw_enc_communication_key),
++				ownerEncBucketKey: owner_enc_bucket_key.object,
++				kdfVersion: KdfType::Argon2id as i64,
++				ownerKeyVersion: convert_version_to_i64(owner_enc_bucket_key.version),
++				userGroupKeyVersion: convert_version_to_i64(external_keys.user_group_key.version),
++			});
++		}
++		Ok(key_data)
++	}
++
++	fn iv(&self) -> InitializationVector {
++		InitializationVector::generate(&self.randomizer_facade)
++	}
++
++	/// TS `getExternalGroupKeys`: the account's external user for the
++	/// address, through `GroupRoot.externalUserReferences` keyed by the
++	/// lower-cased address, or a new one.
++	async fn external_group_keys(
++		&self,
++		mail_address: &str,
++		passphrase_key: &GenericAesKey,
++		verifier: &[u8],
++	) -> Result<ExternalGroupKeys, SecureExternalRecipientError> {
++		let user_group_id = self.user_facade.get_user_group_id();
++		let group_root = self.load_group_root(&user_group_id).await?;
++		let cleaned_address = mail_address.trim().to_lowercase();
++		let reference_id = IdTupleCustom::new(
++			group_root.externalUserReferences,
++			CustomId(BASE64_URL_SAFE_NO_PAD.encode(cleaned_address.as_bytes())),
++		);
++		let reference = match self
++			.typed_entity_client
++			.load::<ExternalUserReference, IdTupleCustom>(&reference_id)
++			.await
++		{
++			Ok(reference) => reference,
++			Err(ApiCallError::ServerResponseError {
++				source: HttpError::NotFoundError,
++			}) => {
++				return self
++					.create_external_user(&cleaned_address, passphrase_key, verifier)
++					.await;
++			},
++			Err(error) => return Err(error.into()),
++		};
++
++		let external_user = self
++			.typed_entity_client
++			.load::<User, GeneratedId>(&reference.user)
++			.await?;
++		let external_mail_group_id = external_user
++			.memberships
++			.iter()
++			.find(|membership| membership.groupType == Some(GroupType::Mail as i64))
++			.ok_or(SecureExternalRecipientError::MalformedExternalUser(
++				"no mail group membership",
++			))?
++			.group
++			.clone();
++		let external_mail_group = self
++			.typed_entity_client
++			.load::<Group, GeneratedId>(&external_mail_group_id)
++			.await?;
++		let external_user_group = self
++			.typed_entity_client
++			.load::<Group, GeneratedId>(&reference.userGroup)
++			.await?;
++		let internal_user_enc_user_key = external_user_group.adminGroupEncGKey.as_ref().ok_or(
++			SecureExternalRecipientError::MalformedExternalUser("user group without admin key"),
++		)?;
++		let user_enc_mail_key = external_mail_group.adminGroupEncGKey.as_ref().ok_or(
++			SecureExternalRecipientError::MalformedExternalUser("mail group without admin key"),
++		)?;
++
++		// The external user group is administered by our user group, at the
++		// version recorded on it.
++		let internal_user_group_key = self
++			.key_loader_facade
++			.load_sym_group_key(
++				&user_group_id,
++				admin_key_version(&external_user_group)?,
++				None,
++			)
++			.await?;
++		let user_group_key = VersionedAesKey::new(
++			internal_user_group_key.decrypt_aes_key(internal_user_enc_user_key)?,
++			key_version(external_user_group.groupKeyVersion)?,
++		);
++		// We are no member of the external user group, so its key at the
++		// version the mail group needs is loaded from the current one.
++		let required_user_group_key = self
++			.key_loader_facade
++			.load_sym_group_key(
++				&reference.userGroup,
++				admin_key_version(&external_mail_group)?,
++				Some(user_group_key.clone()),
++			)
++			.await?;
++		let mail_group_key = VersionedAesKey::new(
++			required_user_group_key.decrypt_aes_key(user_enc_mail_key)?,
++			key_version(external_mail_group.groupKeyVersion)?,
++		);
++		Ok(ExternalGroupKeys {
++			user_group_key,
++			mail_group_key,
++		})
++	}
++
++	/// TS `entityClient.loadRoot(GroupRootTypeRef, userGroupId)`.
++	async fn load_group_root(
++		&self,
++		user_group_id: &GeneratedId,
++	) -> Result<GroupRoot, SecureExternalRecipientError> {
++		let root_id = self
++			.type_model_provider
++			.resolve_client_type_ref(&GroupRoot::type_ref())
++			.ok_or_else(|| ApiCallError::internal("no type model for GroupRoot".to_string()))?
++			.root_id
++			.clone();
++		let root_instance = self
++			.typed_entity_client
++			.load::<RootInstance, IdTupleCustom>(&IdTupleCustom::new(
++				user_group_id.clone(),
++				root_id,
++			))
++			.await?;
++		Ok(self
++			.typed_entity_client
++			.load::<GroupRoot, GeneratedId>(&root_instance.reference)
++			.await?)
++	}
++
++	/// TS `createExternalUser`: fresh user and mail group keys for the
++	/// external user, its user group key wrapped with the passphrase key and
++	/// with our user group key, the info session keys also with our mail
++	/// group key, posted to the `ExternalUserService`.
++	async fn create_external_user(
++		&self,
++		cleaned_address: &str,
++		passphrase_key: &GenericAesKey,
++		verifier: &[u8],
++	) -> Result<ExternalGroupKeys, SecureExternalRecipientError> {
++		let internal_user_group_key =
++			self.user_facade
++				.get_current_user_group_key()
++				.ok_or(KeyLoadError {
++					reason: "the user group key is not unlocked".to_string(),
++				})?;
++		let internal_mail_group_key = self
++			.key_loader_facade
++			.get_current_sym_group_key(
++				&self
++					.user_facade
++					.get_membership_by_group_type(GroupType::Mail)?
++					.group,
++			)
++			.await?;
++
++		let user_group_key = VersionedAesKey::new(self.fresh_key(), 0);
++		let mail_group_key = VersionedAesKey::new(self.fresh_key(), 0);
++		let user_group_info_session_key = self.fresh_key();
++		let mail_group_info_session_key = self.fresh_key();
++		let tutanota_properties_session_key = self.fresh_key();
++		let mailbox_session_key = self.fresh_key();
++		let entropy: [u8; 32] = self.randomizer_facade.generate_random_array();
++
++		let internal_user_enc_user_group_key =
++			internal_user_group_key.encrypt_key(&user_group_key.object, self.iv());
++		let user_group_data = CreateExternalUserGroupData {
++			// A data transfer type is not encrypted, so nothing would fill
++			// the aggregate id in.
++			_id: Some(CustomId(
++				BASE64_URL_SAFE_NO_PAD.encode(self.randomizer_facade.generate_random_array::<4>()),
++			)),
++			mailAddress: cleaned_address.to_string(),
++			externalPwEncUserGroupKey: passphrase_key
++				.encrypt_key(&user_group_key.object, self.iv()),
++			internalUserEncUserGroupKey: internal_user_enc_user_group_key.object,
++			internalUserGroupKeyVersion: convert_version_to_i64(
++				internal_user_enc_user_group_key.version,
++			),
++		};
++		let data = ExternalUserData {
++			_format: 0,
++			verifier: verifier.to_vec(),
++			userGroupData: user_group_data,
++			kdfVersion: KdfType::Argon2id as i64,
++			externalUserEncEntropy: user_group_key.object.encrypt_data(&entropy, self.iv())?,
++			externalUserEncUserGroupInfoSessionKey: user_group_key
++				.encrypt_key(&user_group_info_session_key, self.iv())
++				.object,
++			externalUserEncMailGroupKey: user_group_key
++				.encrypt_key(&mail_group_key.object, self.iv())
++				.object,
++			externalUserEncTutanotaPropertiesSessionKey: user_group_key
++				.encrypt_key(&tutanota_properties_session_key, self.iv())
++				.object,
++			externalMailEncMailGroupInfoSessionKey: mail_group_key
++				.encrypt_key(&mail_group_info_session_key, self.iv())
++				.object,
++			externalMailEncMailBoxSessionKey: mail_group_key
++				.encrypt_key(&mailbox_session_key, self.iv())
++				.object,
++			internalMailEncUserGroupInfoSessionKey: internal_mail_group_key
++				.encrypt_key(&user_group_info_session_key, self.iv())
++				.object,
++			internalMailEncMailGroupInfoSessionKey: internal_mail_group_key
++				.encrypt_key(&mail_group_info_session_key, self.iv())
++				.object,
++			internalMailGroupKeyVersion: convert_version_to_i64(internal_mail_group_key.version),
++		};
++		self.service_executor
++			.post::<ExternalUserService>(data, ExtraServiceParams::default())
++			.await?;
++		Ok(ExternalGroupKeys {
++			user_group_key,
++			mail_group_key,
++		})
++	}
++
++	fn fresh_key(&self) -> GenericAesKey {
++		GenericAesKey::Aes256(Aes256Key::generate(&self.randomizer_facade))
++	}
++}
++
++fn key_version(version: i64) -> Result<u64, SecureExternalRecipientError> {
++	u64::try_from(version)
++		.map_err(|_| SecureExternalRecipientError::MalformedExternalUser("negative key version"))
++}
++
++/// TS `parseKeyVersion(group.adminGroupKeyVersion ?? "0")`.
++fn admin_key_version(group: &Group) -> Result<u64, SecureExternalRecipientError> {
++	key_version(group.adminGroupKeyVersion.unwrap_or(0))
++}
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++	use crate::entities::generated::sys::GroupMembership;
++	use crate::key_loader_facade::MockKeyLoaderFacade;
++	use crate::services::service_executor::MockServiceExecutor;
++	use crate::typed_entity_client::MockTypedEntityClient;
++	use crate::user_facade::MockUserFacade;
++	use crate::util::test_utils::{create_test_entity, mock_type_model_provider};
++	use crypto_primitives::randomizer_facade::test_util::make_thread_rng_facade;
++	use mockall::predicate::eq;
++	use std::sync::Mutex;
++
++	const PASSPHRASE: &str = "correct horse battery staple";
++
++	struct Account {
++		user_group_id: GeneratedId,
++		mail_group_id: GeneratedId,
++		user_group_key: VersionedAesKey,
++		mail_group_key: VersionedAesKey,
++	}
++
++	fn random_key() -> GenericAesKey {
++		GenericAesKey::Aes256(Aes256Key::generate(&make_thread_rng_facade()))
++	}
++
++	fn account() -> Account {
++		Account {
++			user_group_id: GeneratedId::test_random(),
++			mail_group_id: GeneratedId::test_random(),
++			user_group_key: VersionedAesKey::new(random_key(), 3),
++			mail_group_key: VersionedAesKey::new(random_key(), 2),
++		}
++	}
++
++	fn user_facade(account: &Account, account_type: AccountType) -> MockUserFacade {
++		let mut user_facade = MockUserFacade::default();
++		let user = User {
++			accountType: account_type as i64,
++			..create_test_entity()
++		};
++		user_facade.expect_get_user().return_const(Arc::new(user));
++		let mail_group_id = account.mail_group_id.clone();
++		user_facade
++			.expect_get_membership_by_group_type()
++			.withf(|group_type| *group_type == GroupType::Mail)
++			.returning(move |_| {
++				Ok(GroupMembership {
++					group: mail_group_id.clone(),
++					groupType: Some(GroupType::Mail as i64),
++					..create_test_entity()
++				})
++			});
++		user_facade
++			.expect_get_user_group_id()
++			.return_const(account.user_group_id.clone());
++		user_facade
++			.expect_get_current_user_group_key()
++			.return_const(Some(account.user_group_key.clone()));
++		user_facade
++	}
++
++	/// The account's group root, with `externalUserReferences` as its list.
++	fn serve_group_root(
++		entities: &mut MockTypedEntityClient,
++		account: &Account,
++		references: &GeneratedId,
++	) {
++		let group_root_id = GeneratedId::test_random();
++		let root_instance = RootInstance {
++			reference: group_root_id.clone(),
++			..create_test_entity()
++		};
++		let root_id = mock_type_model_provider()
++			.resolve_client_type_ref(&GroupRoot::type_ref())
++			.unwrap()
++			.root_id
++			.clone();
++		entities
++			.expect_load::<RootInstance, IdTupleCustom>()
++			.with(eq(IdTupleCustom::new(
++				account.user_group_id.clone(),
++				root_id,
++			)))
++			.return_const(Ok(root_instance));
++		entities
++			.expect_load::<GroupRoot, GeneratedId>()
++			.with(eq(group_root_id))
++			.return_const(Ok(GroupRoot {
++				externalUserReferences: references.clone(),
++				..create_test_entity()
++			}));
++	}
++
++	fn facade(
++		user_facade: MockUserFacade,
++		key_loader_facade: MockKeyLoaderFacade,
++		entities: MockTypedEntityClient,
++		service_executor: MockServiceExecutor,
++	) -> SecureExternalFacade {
++		SecureExternalFacade::new(
++			Arc::new(user_facade),
++			Arc::new(key_loader_facade),
++			Arc::new(entities),
++			Arc::new(service_executor),
++			Arc::new(mock_type_model_provider()),
++			make_thread_rng_facade(),
++		)
++	}
++
++	fn reference_id(references: &GeneratedId, address: &str) -> IdTupleCustom {
++		IdTupleCustom::new(references.clone(), CustomId::from_custom_string(address))
++	}
++
++	/// What a recipient does with the key data: derive the passphrase key
++	/// from the salt, check it against the verifier, unwrap the external user
++	/// group key with it.
++	fn passphrase_key_of(data: &SecureExternalRecipientKeyData) -> GenericAesKey {
++		let salt: [u8; 16] = data.salt.clone().unwrap().try_into().unwrap();
++		let key = GenericAesKey::Aes256(generate_key_from_passphrase(PASSPHRASE, salt));
++		assert_eq!(data.passwordVerifier, sha256(key.as_bytes()));
++		assert_eq!(data.saltHash.as_deref(), Some(sha256(&salt).as_slice()));
++		assert_eq!(data.kdfVersion, KdfType::Argon2id as i64);
++		key
++	}
++
++	#[tokio::test]
++	async fn an_existing_external_user_gets_the_bucket_key_under_its_mail_group_key() {
++		let account = account();
++		let references = GeneratedId::test_random();
++		let external_user_id = GeneratedId::test_random();
++		let external_user_group_id = GeneratedId::test_random();
++		let external_mail_group_id = GeneratedId::test_random();
++		let external_user_group_key = random_key();
++		let external_mail_group_key = random_key();
++		let randomizer = make_thread_rng_facade();
++
++		let mut entities = MockTypedEntityClient::default();
++		serve_group_root(&mut entities, &account, &references);
++		// The address is looked up trimmed and lower-cased, as TS does.
++		entities
++			.expect_load::<ExternalUserReference, IdTupleCustom>()
++			.with(eq(reference_id(&references, "ext@example.org")))
++			.return_const(Ok(ExternalUserReference {
++				user: external_user_id.clone(),
++				userGroup: external_user_group_id.clone(),
++				..create_test_entity()
++			}));
++		entities
++			.expect_load::<User, GeneratedId>()
++			.with(eq(external_user_id))
++			.return_const(Ok(User {
++				memberships: vec![GroupMembership {
++					group: external_mail_group_id.clone(),
++					groupType: Some(GroupType::Mail as i64),
++					..create_test_entity()
++				}],
++				..create_test_entity()
++			}));
++		entities
++			.expect_load::<Group, GeneratedId>()
++			.with(eq(external_mail_group_id))
++			.return_const(Ok(Group {
++				adminGroupEncGKey: Some(external_user_group_key.encrypt_key(
++					&external_mail_group_key,
++					InitializationVector::generate(&randomizer),
++				)),
++				adminGroupKeyVersion: Some(0),
++				groupKeyVersion: 4,
++				..create_test_entity()
++			}));
++		entities
++			.expect_load::<Group, GeneratedId>()
++			.with(eq(external_user_group_id.clone()))
++			.return_const(Ok(Group {
++				adminGroupEncGKey: Some(account.user_group_key.object.encrypt_key(
++					&external_user_group_key,
++					InitializationVector::generate(&randomizer),
++				)),
++				adminGroupKeyVersion: Some(3),
++				groupKeyVersion: 0,
++				..create_test_entity()
++			}));
++
++		let mut key_loader_facade = MockKeyLoaderFacade::default();
++		let internal_key = account.user_group_key.object.clone();
++		key_loader_facade
++			.expect_load_sym_group_key()
++			.withf({
++				let user_group_id = account.user_group_id.clone();
++				move |group, version, current| {
++					*group == user_group_id && *version == 3 && current.is_none()
++				}
++			})
++			.returning(move |_, _, _| Ok(internal_key.clone()))
++			.once();
++		let current_external_key = external_user_group_key.clone();
++		key_loader_facade
++			.expect_load_sym_group_key()
++			.withf({
++				let external_user_group_key = external_user_group_key.clone();
++				move |group, version, current| {
++					*group == external_user_group_id
++						&& *version == 0 && current.as_ref().is_some_and(|key| {
++						key.object == external_user_group_key && key.version == 0
++					})
++				}
++			})
++			.returning(move |_, _, _| Ok(current_external_key.clone()))
++			.once();
++		let mut service_executor = MockServiceExecutor::default();
++		service_executor
++			.expect_post::<ExternalUserService>()
++			.never();
++
++		let bucket_key = random_key();
++		let key_data = facade(
++			user_facade(&account, AccountType::PAID),
++			key_loader_facade,
++			entities,
++			service_executor,
++		)
++		.secure_external_recipient_key_data(
++			&account.mail_group_id,
++			&bucket_key,
++			&[SecureExternalRecipient {
++				mail_address: " Ext@Example.org ",
++				passphrase: PASSPHRASE,
++			}],
++		)
++		.await
++		.unwrap();
++
++		assert_eq!(key_data.len(), 1);
++		let data = &key_data[0];
++		assert_eq!(data.mailAddress, " Ext@Example.org ");
++		assert!(data._id.is_none());
++		let passphrase_key = passphrase_key_of(data);
++		let unwrapped_user_key = passphrase_key
++			.decrypt_aes_key(data.pwEncCommunicationKey.as_ref().unwrap())
++			.unwrap();
++		assert_eq!(unwrapped_user_key, external_user_group_key);
++		assert_eq!(data.userGroupKeyVersion, 0);
++		let unwrapped_bucket_key = external_mail_group_key
++			.decrypt_aes_key(&data.ownerEncBucketKey)
++			.unwrap();
++		assert_eq!(unwrapped_bucket_key, bucket_key);
++		assert_eq!(data.ownerKeyVersion, 4);
++	}
++
++	#[tokio::test]
++	async fn a_new_external_user_is_created_with_keys_only_the_sender_and_recipient_can_open() {
++		let account = account();
++		let references = GeneratedId::test_random();
++		let mut entities = MockTypedEntityClient::default();
++		serve_group_root(&mut entities, &account, &references);
++		entities
++			.expect_load::<ExternalUserReference, IdTupleCustom>()
++			.with(eq(reference_id(&references, "new@example.org")))
++			.returning(|_| {
++				Err(ApiCallError::ServerResponseError {
++					source: HttpError::NotFoundError,
++				})
++			});
++		entities.expect_load::<User, GeneratedId>().never();
++		entities.expect_load::<Group, GeneratedId>().never();
++
++		let mut key_loader_facade = MockKeyLoaderFacade::default();
++		let mail_group_key = account.mail_group_key.clone();
++		key_loader_facade
++			.expect_get_current_sym_group_key()
++			.with(eq(account.mail_group_id.clone()))
++			.returning(move |_| Ok(mail_group_key.clone()))
++			.once();
++		key_loader_facade.expect_load_sym_group_key().never();
++
++		let posted: Arc<Mutex<Option<ExternalUserData>>> = Arc::default();
++		let mut service_executor = MockServiceExecutor::default();
++		service_executor
++			.expect_post::<ExternalUserService>()
++			.returning({
++				let posted = posted.clone();
++				move |data, _| {
++					*posted.lock().unwrap() = Some(data);
++					Ok(())
++				}
++			})
++			.once();
++
++		let bucket_key = random_key();
++		let key_data = facade(
++			user_facade(&account, AccountType::FREE),
++			key_loader_facade,
++			entities,
++			service_executor,
++		)
++		.secure_external_recipient_key_data(
++			&account.mail_group_id,
++			&bucket_key,
++			&[SecureExternalRecipient {
++				mail_address: "New@Example.org",
++				passphrase: PASSPHRASE,
++			}],
++		)
++		.await
++		.unwrap();
++
++		let data = &key_data[0];
++		let passphrase_key = passphrase_key_of(data);
++		let created = posted.lock().unwrap().take().unwrap();
++		let group_data = &created.userGroupData;
++		assert_eq!(group_data.mailAddress, "new@example.org");
++		assert!(group_data._id.is_some());
++		assert_eq!(created.verifier, data.passwordVerifier);
++		assert_eq!(created.kdfVersion, KdfType::Argon2id as i64);
++		// The recipient opens the external user group key with the
++		// passphrase, the sender with its own user group key.
++		let user_group_key = passphrase_key
++			.decrypt_aes_key(&group_data.externalPwEncUserGroupKey)
++			.unwrap();
++		assert_eq!(
++			account
++				.user_group_key
++				.object
++				.decrypt_aes_key(&group_data.internalUserEncUserGroupKey)
++				.unwrap(),
++			user_group_key
++		);
++		assert_eq!(group_data.internalUserGroupKeyVersion, 3);
++		assert_eq!(
++			passphrase_key
++				.decrypt_aes_key(data.pwEncCommunicationKey.as_ref().unwrap())
++				.unwrap(),
++			user_group_key
++		);
++		assert_eq!(data.userGroupKeyVersion, 0);
++		let mail_group_key = user_group_key
++			.decrypt_aes_key(&created.externalUserEncMailGroupKey)
++			.unwrap();
++		assert_eq!(
++			mail_group_key
++				.decrypt_aes_key(&data.ownerEncBucketKey)
++				.unwrap(),
++			bucket_key
++		);
++		assert_eq!(data.ownerKeyVersion, 0);
++		// The group infos are readable by the sender's mail group too.
++		let user_info_key = user_group_key
++			.decrypt_aes_key(&created.externalUserEncUserGroupInfoSessionKey)
++			.unwrap();
++		assert_eq!(
++			account
++				.mail_group_key
++				.object
++				.decrypt_aes_key(&created.internalMailEncUserGroupInfoSessionKey)
++				.unwrap(),
++			user_info_key
++		);
++		let mail_info_key = mail_group_key
++			.decrypt_aes_key(&created.externalMailEncMailGroupInfoSessionKey)
++			.unwrap();
++		assert_eq!(
++			account
++				.mail_group_key
++				.object
++				.decrypt_aes_key(&created.internalMailEncMailGroupInfoSessionKey)
++				.unwrap(),
++			mail_info_key
++		);
++		assert_eq!(created.internalMailGroupKeyVersion, 2);
++		mail_group_key
++			.decrypt_aes_key(&created.externalMailEncMailBoxSessionKey)
++			.unwrap();
++		user_group_key
++			.decrypt_aes_key(&created.externalUserEncTutanotaPropertiesSessionKey)
++			.unwrap();
++		assert_eq!(
++			user_group_key
++				.decrypt_data(&created.externalUserEncEntropy)
++				.unwrap()
++				.len(),
++			32
++		);
++	}
++
++	fn untouched() -> (
++		MockKeyLoaderFacade,
++		MockTypedEntityClient,
++		MockServiceExecutor,
++	) {
++		let mut key_loader_facade = MockKeyLoaderFacade::default();
++		key_loader_facade.expect_load_sym_group_key().never();
++		key_loader_facade.expect_get_current_sym_group_key().never();
++		let mut entities = MockTypedEntityClient::default();
++		entities
++			.expect_load::<RootInstance, IdTupleCustom>()
++			.never();
++		let mut service_executor = MockServiceExecutor::default();
++		service_executor
++			.expect_post::<ExternalUserService>()
++			.never();
++		(key_loader_facade, entities, service_executor)
++	}
++
++	#[tokio::test]
++	async fn shared_mailboxes_and_external_senders_are_refused_before_any_request() {
++		let account = account();
++		let recipient = [SecureExternalRecipient {
++			mail_address: "ext@example.org",
++			passphrase: PASSPHRASE,
++		}];
++		let (key_loader_facade, entities, service_executor) = untouched();
++		let shared = facade(
++			user_facade(&account, AccountType::PAID),
++			key_loader_facade,
++			entities,
++			service_executor,
++		)
++		.secure_external_recipient_key_data(&GeneratedId::test_random(), &random_key(), &recipient)
++		.await;
++		assert!(matches!(
++			shared,
++			Err(SecureExternalRecipientError::SharedMailboxSender)
++		));
++
++		let (key_loader_facade, entities, service_executor) = untouched();
++		let external = facade(
++			user_facade(&account, AccountType::EXTERNAL),
++			key_loader_facade,
++			entities,
++			service_executor,
++		)
++		.secure_external_recipient_key_data(&account.mail_group_id, &random_key(), &recipient)
++		.await;
++		assert!(matches!(
++			external,
++			Err(SecureExternalRecipientError::ExternalSender)
++		));
++	}
++
++	#[tokio::test]
++	async fn every_recipient_without_a_passphrase_is_named_and_nothing_is_built() {
++		let account = account();
++		let (key_loader_facade, entities, service_executor) = untouched();
++		let result = facade(
++			user_facade(&account, AccountType::PAID),
++			key_loader_facade,
++			entities,
++			service_executor,
++		)
++		.secure_external_recipient_key_data(
++			&account.mail_group_id,
++			&random_key(),
++			&[
++				SecureExternalRecipient {
++					mail_address: "a@example.org",
++					passphrase: "",
++				},
++				SecureExternalRecipient {
++					mail_address: "b@example.org",
++					passphrase: PASSPHRASE,
++				},
++				SecureExternalRecipient {
++					mail_address: "c@example.org",
++					passphrase: "",
++				},
++			],
++		)
++		.await;
++		match result {
++			Err(SecureExternalRecipientError::MissingPassphrase(missing)) => {
++				assert_eq!(missing, ["a@example.org", "c@example.org"]);
++			},
++			other => panic!("{:?}", other.map(|data| data.len())),
++		}
++	}
++}
+diff --git a/tuta-sdk/rust/sdk/src/entity_client.rs b/tuta-sdk/rust/sdk/src/entity_client.rs
+index bd11f06..b91131a 100644
+--- a/tuta-sdk/rust/sdk/src/entity_client.rs
++++ b/tuta-sdk/rust/sdk/src/entity_client.rs
+@@ -356,10 +356,13 @@ impl EntityClient {
+ 			.post_instance_changes(parsed_entity, type_ref, HttpMethod::POST)
+ 			.await?;
+ 
+-		assert!(
+-			response.status >= 200 && response.status <= 300,
+-			"non-ok status code"
+-		);
++		// A refused create is an error for the caller, not a panic: the
++		// process may still have a reply to give for work done before it.
++		if !(200..=299).contains(&response.status) {
++			return Err(ApiCallError::ServerResponseError {
++				source: HttpError::from_http_response(response.status, &response.headers)?,
++			});
++		}
+ 
+ 		let raw_response = response
+ 			.body
+diff --git a/tuta-sdk/rust/sdk/src/lib.rs b/tuta-sdk/rust/sdk/src/lib.rs
+index 0d3cc8a..de19bb5 100644
+--- a/tuta-sdk/rust/sdk/src/lib.rs
++++ b/tuta-sdk/rust/sdk/src/lib.rs
+@@ -18,6 +18,9 @@ use crate::crypto::asymmetric_crypto_facade::AsymmetricCryptoFacade;
+ use crate::crypto::asymmetric_crypto_facade::{
+ 	AsymmetricCryptoError, InternalRecipientKey, InternalRecipientKeyError,
+ };
++use crate::crypto::secure_external_facade::{
++	SecureExternalFacade, SecureExternalRecipient, SecureExternalRecipientError,
++};
+ #[cfg_attr(test, mockall_double::double)]
+ use crate::crypto::crypto_facade::CryptoFacade;
+ #[cfg_attr(test, mockall_double::double)]
+@@ -28,7 +31,7 @@ use crate::date::date_provider::SystemDateProvider;
+ use crate::element_value::{ElementValue, ParsedEntity};
+ use crate::entities::entity_facade::{EntityFacade, EntityFacadeImpl};
+ use crate::entities::generated::sys::User;
+-use crate::entities::generated::tutanota::Mail;
++use crate::entities::generated::tutanota::{Mail, SecureExternalRecipientKeyData};
+ #[cfg_attr(test, mockall_double::double)]
+ use crate::entity_client::EntityClient;
+ use crate::instance_mapper::InstanceMapper;
+@@ -267,6 +270,14 @@ impl Sdk {
+ 			service_executor.clone(),
+ 			public_key_provider.clone(),
+ 		));
++		let secure_external_facade = Arc::new(SecureExternalFacade::new(
++			user_facade.clone(),
++			key_loader_facade.clone(),
++			typed_entity_client.clone(),
++			service_executor.clone(),
++			self.type_model_provider.clone(),
++			RandomizerFacade::from_core(rand_core::OsRng),
++		));
+ 		let crypto_facade: Arc<CryptoFacade> = Arc::new(CryptoFacade::new(
+ 			key_loader_facade.clone(),
+ 			self.instance_mapper.clone(),
+@@ -307,6 +318,8 @@ impl Sdk {
+ 			crypto_entity_client.clone(),
+ 			self.type_model_provider.clone(),
+ 			user_facade.clone(),
++			key_loader_facade.clone(),
++			RandomizerFacade::from_core(rand_core::OsRng),
+ 		));
+ 
+ 		let customer_facade = Arc::new(CustomerFacade::new(
+@@ -319,6 +332,7 @@ impl Sdk {
+ 			entity_client,
+ 			service_executor,
+ 			asymmetric_crypto_facade,
++			secure_external_facade,
+ 			typed_entity_client,
+ 			crypto_entity_client,
+ 			instance_mapper: Arc::clone(&self.instance_mapper),
+@@ -436,6 +450,7 @@ pub struct LoggedInSdk {
+ 	crypto_entity_client: Arc<CryptoEntityClient>,
+ 	blob_facade: Arc<BlobFacade>,
+ 	asymmetric_crypto_facade: Arc<AsymmetricCryptoFacade>,
++	secure_external_facade: Arc<SecureExternalFacade>,
+ 	pub instance_mapper: Arc<InstanceMapper>,
+ 	pub type_model_provider: Arc<TypeModelProvider>,
+ 	pub contact_facade: Arc<ContactFacade>,
+@@ -508,6 +523,22 @@ impl LoggedInSdk {
+ 			.await
+ 	}
+ 
++	/// Builds the password-protected key data for a confidential mail's
++	/// recipients outside Tuta (see
++	/// `SecureExternalFacade::secure_external_recipient_key_data`), creating
++	/// their external users where needed. Refused from a shared mailbox or an
++	/// external user, as the TS `MailFacade.addRecipientKeyData` refuses.
++	pub async fn secure_external_recipient_key_data(
++		&self,
++		sender_mail_group_id: &GeneratedId,
++		bucket_key: &GenericAesKey,
++		recipients: &[SecureExternalRecipient<'_>],
++	) -> Result<Vec<SecureExternalRecipientKeyData>, SecureExternalRecipientError> {
++		self.secure_external_facade
++			.secure_external_recipient_key_data(sender_mail_group_id, bucket_key, recipients)
++			.await
++	}
++
+ 	#[must_use]
+ 	pub fn get_user_group_id(&self) -> GeneratedId {
+ 		self.user_facade.get_user_group_id()
