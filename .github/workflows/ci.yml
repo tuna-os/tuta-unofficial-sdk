@@ -1,0 +1,98 @@
+name: CI
+
+# The workspace builds against the Tuta SDK that prepare.sh prepares from the
+# submodules (tutabridge, and the tutanota checkout inside it) plus our own
+# patches in sdk-patches/, so every job checks out recursively and prepares
+# first. Live tests are #[ignore]d and never run here: they need an account.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test, clippy, fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Prepare the Tuta SDK
+        # sdk-prepare.py runs git in the submodules.
+        run: |
+          git config --global --add safe.directory '*'
+          sh prepare.sh
+
+      - name: Fetch the crates
+        # Fetched first so the tests run as packaged builds do: offline, from
+        # the lock file alone.
+        run: cargo fetch --locked
+
+      - name: Format
+        run: cargo fmt -p tuta-unofficial-sdk -p tuta-helper --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked --offline
+
+      - name: Build the example
+        run: cargo build --example read_mail --locked --offline
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Prepare the Tuta SDK
+        # cargo-deny reads `cargo metadata`, which needs the prepared path
+        # crates to exist.
+        run: |
+          git config --global --add safe.directory '*'
+          sh prepare.sh
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  cargo-sources:
+    name: cargo-sources.json is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Regenerate and compare
+        run: |
+          scripts/cargo-sources.sh "$RUNNER_TEMP/cargo-sources.json"
+          diff -u cargo-sources.json "$RUNNER_TEMP/cargo-sources.json"
