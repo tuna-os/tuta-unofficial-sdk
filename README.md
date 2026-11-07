@@ -786,7 +786,7 @@ cdylibs come along), generates the bindings from it with `tuta-ffi-bindgen`
 when packaging), and writes the AAR and the zipped Maven repository to
 `android/tuta-sdk-android/build/dist/`. Without an Android SDK the
 `:tuta-sdk-android` module is left out, so the JVM tests run on a host with
-only a JDK and Rust. The [Tuna Mail build image](https://github.com/tuna-os/thunderbird-android/tree/main/tools/build-env)
+only a JDK and Rust. The [Tuna Mail build image](https://github.com/tuna-os/tuna-mail/tree/main/tools/build-env)
 has every tool `dist` needs.
 
 The JVM tests (`android/tuta-sdk-jvm`) compile the same Kotlin sources for
