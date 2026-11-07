@@ -69,6 +69,9 @@ codes! {
     SessionRevoked => "session_revoked",
     /// The server refuses this client version: the pinned SDK needs an update.
     ClientOutdated => "client_outdated",
+    /// A sign-in's pending session is gone (expired or cancelled on the
+    /// server): start the sign-in over.
+    PendingSessionExpired => "pending_session_expired",
     // Transport.
     /// No connection, an outage, or throttling.
     TransportFailed => "transport_failed",
@@ -76,6 +79,9 @@ codes! {
     RequestFailed => "request_failed",
     /// The operation overran its time limit.
     Timeout => "timeout",
+    /// Tuta is throttling this client or account (HTTP 429, or too many
+    /// failed second-factor attempts): wait, then try again.
+    RateLimited => "rate_limited",
     // Content.
     /// A mail, folder or attachment could not be decrypted.
     DecryptionFailed => "decryption_failed",
@@ -203,11 +209,11 @@ pub(crate) fn api_code(error: ApiCallError, fallback: Error, not_found: Error) -
             HttpError::NotFoundError => not_found,
             HttpError::RequestTimeoutError => Error::Timeout,
             HttpError::LimitReachedError => Error::LimitReached,
+            HttpError::TooManyRequestsError { .. } => Error::RateLimited,
             HttpError::ConnectionError
             | HttpError::InternalServerError
             | HttpError::BadGatewayError
             | HttpError::ServiceUnavailableError { .. }
-            | HttpError::TooManyRequestsError { .. }
             | HttpError::LockedError => Error::TransportFailed,
             _ => fallback,
         },
@@ -245,11 +251,11 @@ fn server_error(error: HttpError) -> Error {
         | HttpError::AccessDeactivatedError
         | HttpError::AccessBlockedError => Error::SessionRevoked,
         HttpError::RequestTimeoutError => Error::Timeout,
+        HttpError::TooManyRequestsError { .. } => Error::RateLimited,
         HttpError::ConnectionError
         | HttpError::InternalServerError
         | HttpError::BadGatewayError
         | HttpError::ServiceUnavailableError { .. }
-        | HttpError::TooManyRequestsError { .. }
         | HttpError::LockedError => Error::TransportFailed,
         _ => Error::ResumeFailed,
     }
@@ -268,15 +274,68 @@ pub(crate) fn initiate_error(error: LoginError) -> Error {
         } => match source {
             HttpError::InvalidSoftwareVersionError => Error::ClientOutdated,
             HttpError::RequestTimeoutError => Error::Timeout,
+            HttpError::TooManyRequestsError { .. } => Error::RateLimited,
             HttpError::ConnectionError
             | HttpError::InternalServerError
             | HttpError::BadGatewayError
-            | HttpError::ServiceUnavailableError { .. }
-            | HttpError::TooManyRequestsError { .. } => Error::TransportFailed,
+            | HttpError::ServiceUnavailableError { .. } => Error::TransportFailed,
             _ => Error::LoginFailed,
         },
         _ => Error::LoginFailed,
     }
+}
+
+/// Which code a failed second-factor step reports, for a sign-in whose
+/// session the server opened and is waiting on. `check` is the status
+/// request (GET), `submit` the code itself (POST), as the official
+/// client's `SecondFactorAuthDialog` reads them: a refused code is
+/// `second_factor_failed`, a session the server no longer knows is
+/// `pending_session_expired`, too many attempts are `rate_limited`.
+pub(crate) fn second_factor_error(error: LoginError, submit: bool) -> Error {
+    match error {
+        LoginError::InvalidAccessToken { .. }
+        | LoginError::InvalidPassphrase { .. }
+        | LoginError::InvalidKey { .. } => Error::SessionInvalid,
+        LoginError::ApiCall { source } => match source {
+            ApiCallError::RestClient { .. } => Error::TransportFailed,
+            ApiCallError::ServerResponseError { source } => match source {
+                HttpError::InvalidSoftwareVersionError => Error::ClientOutdated,
+                HttpError::RequestTimeoutError => Error::Timeout,
+                HttpError::TooManyRequestsError { .. } | HttpError::AccessBlockedError => {
+                    Error::RateLimited
+                }
+                HttpError::NotFoundError
+                | HttpError::SessionExpiredError
+                | HttpError::AccessExpiredError
+                | HttpError::AccessDeactivatedError => Error::PendingSessionExpired,
+                // Only the status check reads 401 as a dead session; for the
+                // code itself it is the official client's "wrong code".
+                HttpError::NotAuthenticatedError if !submit => Error::PendingSessionExpired,
+                HttpError::ConnectionError
+                | HttpError::InternalServerError
+                | HttpError::BadGatewayError
+                | HttpError::ServiceUnavailableError { .. }
+                | HttpError::LockedError => Error::TransportFailed,
+                _ => Error::SecondFactorFailed,
+            },
+            ApiCallError::InternalSdkError { .. } => Error::SecondFactorFailed,
+        },
+    }
+}
+
+/// Whether a sign-in that failed with `code` in its second-factor step can
+/// still be retried on the same pending session: a wrong or missing code, an
+/// outage or throttling can; a dead, blocked or corrupt session cannot.
+pub(crate) fn keeps_pending(code: Error) -> bool {
+    matches!(
+        code,
+        Error::SecondFactorRequired
+            | Error::SecondFactorFailed
+            | Error::InvalidTotp
+            | Error::TransportFailed
+            | Error::Timeout
+            | Error::RateLimited
+    )
 }
 
 /// Which code to report when none of the offered challenges is TOTP: name
@@ -379,6 +438,107 @@ mod tests {
             initiate_error(server(HttpError::NotAuthenticatedError)),
             Error::LoginFailed
         );
+    }
+
+    #[test]
+    fn throttling_is_rate_limited_not_an_outage() {
+        let throttled = || {
+            server(HttpError::TooManyRequestsError {
+                suspension_time_sec: None,
+            })
+        };
+        assert_eq!(initiate_error(throttled()), Error::RateLimited);
+        assert_eq!(resume_error(throttled()), Error::RateLimited);
+        assert_eq!(second_factor_error(throttled(), true), Error::RateLimited);
+        assert_eq!(second_factor_error(throttled(), false), Error::RateLimited);
+        assert_eq!(
+            api_code(
+                ApiCallError::ServerResponseError {
+                    source: HttpError::TooManyRequestsError {
+                        suspension_time_sec: None
+                    }
+                },
+                Error::FolderFailed,
+                Error::FolderNotFound
+            ),
+            Error::RateLimited
+        );
+    }
+
+    #[test]
+    fn second_factor_failures_read_as_the_official_client_reads_them() {
+        // The code itself: 401 and 400 are a wrong code.
+        assert_eq!(
+            second_factor_error(server(HttpError::NotAuthenticatedError), true),
+            Error::SecondFactorFailed
+        );
+        assert_eq!(
+            second_factor_error(server(HttpError::BadRequestError), true),
+            Error::SecondFactorFailed
+        );
+        assert_eq!(
+            second_factor_error(server(HttpError::AccessBlockedError), true),
+            Error::RateLimited
+        );
+        // A session the server forgot, whichever request noticed.
+        for submit in [true, false] {
+            for gone in [
+                HttpError::NotFoundError,
+                HttpError::SessionExpiredError,
+                HttpError::AccessExpiredError,
+            ] {
+                assert_eq!(
+                    second_factor_error(server(gone), submit),
+                    Error::PendingSessionExpired
+                );
+            }
+        }
+        assert_eq!(
+            second_factor_error(server(HttpError::NotAuthenticatedError), false),
+            Error::PendingSessionExpired
+        );
+        assert_eq!(
+            second_factor_error(
+                LoginError::ApiCall {
+                    source: ApiCallError::RestClient {
+                        source: RestClientError::NetworkError,
+                    },
+                },
+                true
+            ),
+            Error::TransportFailed
+        );
+        assert_eq!(
+            second_factor_error(
+                LoginError::InvalidAccessToken {
+                    error_message: String::new()
+                },
+                false
+            ),
+            Error::SessionInvalid
+        );
+    }
+
+    #[test]
+    fn only_a_retryable_second_factor_failure_keeps_the_pending_session() {
+        for code in [
+            Error::SecondFactorRequired,
+            Error::SecondFactorFailed,
+            Error::InvalidTotp,
+            Error::TransportFailed,
+            Error::Timeout,
+            Error::RateLimited,
+        ] {
+            assert!(keeps_pending(code), "{code}");
+        }
+        for code in [
+            Error::PendingSessionExpired,
+            Error::SessionInvalid,
+            Error::ClientOutdated,
+            Error::LoginFailed,
+        ] {
+            assert!(!keeps_pending(code), "{code}");
+        }
     }
 
     #[test]

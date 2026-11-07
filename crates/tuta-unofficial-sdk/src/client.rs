@@ -2,7 +2,9 @@
 
 use crate::{
     diag,
-    error::{initiate_error, resume_error, unsupported_factor_code},
+    error::{
+        initiate_error, keeps_pending, resume_error, second_factor_error, unsupported_factor_code,
+    },
     transport, Error, Result,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -105,12 +107,32 @@ impl Client {
 
     /// Sign in with an address and password, plus a six-digit TOTP code when
     /// the account has a second factor. U2F and WebAuthn are not supported.
+    ///
+    /// A failure in the second-factor step drops the session the server
+    /// opened for it; [`Client::sign_in`] hands it back for a retry instead.
     pub async fn login(
         &self,
         email: &str,
         password: &SecretString,
         totp: Option<&str>,
     ) -> Result<Session> {
+        self.sign_in(email, password, totp)
+            .await
+            .map_err(|failure| failure.code)
+    }
+
+    /// Sign in as [`Client::login`] does, but when the account wants a
+    /// second factor and the code is missing, malformed or refused, or the
+    /// step failed in a way worth retrying, the failure carries the
+    /// [`PendingSession`] the server opened: complete it with
+    /// [`Client::complete_sign_in`] rather than signing in again, which
+    /// would open another session (and Tuta throttles sign-ins).
+    pub async fn sign_in(
+        &self,
+        email: &str,
+        password: &SecretString,
+        totp: Option<&str>,
+    ) -> Result<Session, SignInError> {
         let initiated = self
             .sdk
             .initiate_session(email, password.expose_secret(), &self.client_name)
@@ -119,48 +141,107 @@ impl Client {
                 diag::failed("sign-in", &error);
                 initiate_error(error)
             })?;
-        if !initiated.challenges.is_empty() {
-            let offers_totp = initiated
-                .challenges
-                .iter()
-                .any(|c| c.r#type == SecondFactorType::Totp as i64);
-            if !offers_totp {
-                let types: Vec<i64> = initiated.challenges.iter().map(|c| c.r#type).collect();
-                return Err(unsupported_factor_code(&types));
+        if initiated.challenges.is_empty() {
+            return self
+                .finish(PendingSession(SavedSession::from_credentials(
+                    initiated.credentials,
+                )))
+                .await;
+        }
+        let offers_totp = initiated
+            .challenges
+            .iter()
+            .any(|c| c.r#type == SecondFactorType::Totp as i64);
+        if !offers_totp {
+            let types: Vec<i64> = initiated.challenges.iter().map(|c| c.r#type).collect();
+            return Err(unsupported_factor_code(&types).into());
+        }
+        let pending = PendingSession(SavedSession::from_credentials(initiated.credentials));
+        match totp {
+            None => Err(SignInError::pending(Error::SecondFactorRequired, pending)),
+            Some(code) => self.second_factor(pending, code, false).await,
+        }
+    }
+
+    /// Finish a sign-in that is waiting for its second factor, on the
+    /// session the server already opened for it. A wrong code can be
+    /// retried on the same session again; `pending_session_expired` means
+    /// the server let it go: sign in again.
+    pub async fn complete_sign_in(
+        &self,
+        pending: PendingSession,
+        totp: &str,
+    ) -> Result<Session, SignInError> {
+        self.second_factor(pending, totp, true).await
+    }
+
+    /// Submit `code` for `pending`, wait for the server to accept it, and
+    /// sign in. With `check`, ask first whether the session still waits for
+    /// its second factor: one that is already through (a retry after the
+    /// code went in but the sign-in did not finish) goes straight on.
+    async fn second_factor(
+        &self,
+        pending: PendingSession,
+        code: &str,
+        check: bool,
+    ) -> Result<Session, SignInError> {
+        let Some(code) = totp_code(code) else {
+            return Err(SignInError::pending(Error::InvalidTotp, pending));
+        };
+        let failed = |stage: &str, error: LoginError, submit: bool, pending: PendingSession| {
+            diag::failed(stage, &error);
+            SignInError::after(second_factor_error(error, submit), pending)
+        };
+        let token = pending.0.access_token().to_string();
+        let waiting = if check {
+            match self.sdk.is_second_factor_pending(&token).await {
+                Ok(waiting) => waiting,
+                Err(error) => return Err(failed("second factor check", error, false, pending)),
             }
-            let code = totp.ok_or(Error::SecondFactorRequired)?;
-            if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::InvalidTotp);
-            }
-            self.sdk
-                .authenticate_with_second_factor_totp(
-                    &initiated.credentials.access_token,
-                    code.parse().map_err(|_| Error::InvalidTotp)?,
-                )
+        } else {
+            true
+        };
+        if waiting {
+            if let Err(error) = self
+                .sdk
+                .authenticate_with_second_factor_totp(&token, code)
                 .await
-                .map_err(diag::fail("second factor", Error::SecondFactorFailed))?;
+            {
+                return Err(failed("second factor", error, true, pending));
+            }
             for _ in 0..SECOND_FACTOR_POLLS {
-                if !self
-                    .sdk
-                    .is_second_factor_pending(&initiated.credentials.access_token)
-                    .await
-                    .map_err(diag::fail("second factor poll", Error::SecondFactorFailed))?
-                {
-                    break;
+                match self.sdk.is_second_factor_pending(&token).await {
+                    Ok(false) => break,
+                    Ok(true) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Err(error) => return Err(failed("second factor poll", error, false, pending)),
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
-        let logged_in = self
-            .sdk
-            .login(initiated.credentials.clone())
-            .await
-            .map_err(diag::fail("session login", Error::LoginFailed))?;
-        Ok(Session {
-            sdk: logged_in,
-            saved: SavedSession::from_credentials(initiated.credentials),
-            base_url: self.base_url.clone(),
-        })
+        self.finish(pending).await
+    }
+
+    /// Log in on a session the server has opened and authenticated.
+    async fn finish(&self, pending: PendingSession) -> Result<Session, SignInError> {
+        match self.sdk.login(pending.0.credentials()).await {
+            Ok(logged_in) => Ok(Session {
+                sdk: logged_in,
+                saved: pending.0,
+                base_url: self.base_url.clone(),
+            }),
+            Err(error) => {
+                diag::failed("session login", &error);
+                // Only an outage or throttling is worth retrying on the same
+                // session; anything else reads as a refused sign-in.
+                let code = match resume_error(error) {
+                    code @ (Error::TransportFailed
+                    | Error::RateLimited
+                    | Error::Timeout
+                    | Error::ClientOutdated) => code,
+                    _ => Error::LoginFailed,
+                };
+                Err(SignInError::after(code, pending))
+            }
+        }
     }
 
     /// Resume a saved session: [`Session::resume`].
@@ -365,6 +446,75 @@ impl<'de> Deserialize<'de> for SavedSession {
     }
 }
 
+/// A sign-in waiting for its second factor: the session the server opened
+/// for it, serialized exactly like a [`SavedSession`] (the helper
+/// protocol's `pending_session`). It is a credential: keep it in memory
+/// only, and drop it when the address or password changes. An abandoned
+/// one expires on the server. Deliberately not `Debug`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PendingSession(SavedSession);
+
+impl PendingSession {
+    /// The address the sign-in is for, as it was entered.
+    pub fn login(&self) -> &str {
+        self.0.login()
+    }
+}
+
+/// A failed sign-in: its [`Error`] code and, when the second factor can be
+/// retried on the same session, the [`PendingSession`] to retry it on.
+pub struct SignInError {
+    pub code: Error,
+    pub pending: Option<PendingSession>,
+}
+
+impl SignInError {
+    /// A failure that always keeps the session (`second_factor_required`,
+    /// a malformed code).
+    fn pending(code: Error, pending: PendingSession) -> Self {
+        SignInError {
+            code,
+            pending: Some(pending),
+        }
+    }
+
+    /// A failure after the session was opened: kept only if a retry on it
+    /// makes sense.
+    fn after(code: Error, pending: PendingSession) -> Self {
+        SignInError {
+            code,
+            pending: keeps_pending(code).then_some(pending),
+        }
+    }
+}
+
+impl From<Error> for SignInError {
+    fn from(code: Error) -> Self {
+        SignInError {
+            code,
+            pending: None,
+        }
+    }
+}
+
+impl fmt::Debug for SignInError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignInError")
+            .field("code", &self.code)
+            .field("pending", &self.pending.is_some())
+            .finish()
+    }
+}
+
+/// A TOTP code as the server takes it: exactly six ASCII digits.
+fn totp_code(code: &str) -> Option<u32> {
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok()
+}
+
 // First bytes of an access token: the session list id. Mirrors the SDK's own
 // session id parsing, which lives behind a private function.
 const GENERATED_ID_BYTES: usize = 9;
@@ -422,5 +572,52 @@ mod tests {
             serde_json::json!({"login": "a", "user_id": "u", "access_token": "t"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_totp_code_is_six_digits() {
+        assert_eq!(totp_code("012345"), Some(12345));
+        for bad in ["", "12345", "1234567", "12345a", " 12345", "１２３４５６"] {
+            assert_eq!(totp_code(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_pending_session_is_shaped_like_a_saved_one() {
+        let json = serde_json::json!({"login": "a@tuta.com", "user_id": "u",
+            "access_token": "t", "encrypted_passphrase_key": [1, 2]});
+        let pending: PendingSession = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(pending.login(), "a@tuta.com");
+        assert_eq!(serde_json::to_value(&pending).unwrap(), json);
+        assert!(
+            serde_json::from_value::<PendingSession>(serde_json::json!({"login": "a"})).is_err()
+        );
+    }
+
+    #[test]
+    fn a_sign_in_failure_keeps_its_session_only_when_a_retry_can_use_it() {
+        let pending = || {
+            serde_json::from_value::<PendingSession>(serde_json::json!({
+            "login": "a", "user_id": "u", "access_token": "t", "encrypted_passphrase_key": []}))
+            .unwrap()
+        };
+        assert!(SignInError::pending(Error::SecondFactorRequired, pending())
+            .pending
+            .is_some());
+        assert!(SignInError::after(Error::SecondFactorFailed, pending())
+            .pending
+            .is_some());
+        assert!(SignInError::after(Error::RateLimited, pending())
+            .pending
+            .is_some());
+        assert!(SignInError::after(Error::PendingSessionExpired, pending())
+            .pending
+            .is_none());
+        assert!(SignInError::after(Error::LoginFailed, pending())
+            .pending
+            .is_none());
+        assert!(SignInError::from(Error::LoginFailed).pending.is_none());
+        let debug = format!("{:?}", SignInError::pending(Error::InvalidTotp, pending()));
+        assert_eq!(debug, "SignInError { code: InvalidTotp, pending: true }");
     }
 }

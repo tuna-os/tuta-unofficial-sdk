@@ -144,6 +144,30 @@ class NativeContractTest {
     }
 
     @Test
+    fun aPendingSignInIsHandedBackForTheCode() {
+        val pending = TutaPendingSession(Json.parseToJsonElement(session.json).jsonObject)
+        assertEquals("TutaPendingSession(<redacted>)", pending.toString())
+        fun attempt(email: String = "a@tuta.com", totp: String?) =
+            assertFailsWith<TutaException> { runBlocking { client.login(email, "password", totp, pending) } }
+
+        val waiting = attempt(totp = null)
+        assertEquals(TutaErrorCode.SECOND_FACTOR_REQUIRED, waiting.code)
+        assertEquals("a@tuta.com", waiting.pendingSession?.login)
+        val malformed = attempt(totp = "12a")
+        assertEquals(TutaErrorCode.INVALID_TOTP, malformed.code)
+        assertEquals("a@tuta.com", malformed.pendingSession?.login)
+        // The code goes to the same session; the outage keeps it for a retry.
+        val offline = attempt(totp = "123456")
+        assertIs<TutaException.Transport>(offline)
+        assertEquals("a@tuta.com", offline.pendingSession?.login)
+        val otherAddress = attempt(email = "eve@tuta.com", totp = "123456")
+        assertEquals(TutaErrorCode.INVALID_REQUEST, otherAddress.code)
+        assertNull(otherAddress.pendingSession)
+        assertIs<TutaException.Transport>(TutaException.of("rate_limited"))
+        assertIs<TutaException.Session>(TutaException.of("pending_session_expired"))
+    }
+
+    @Test
     fun anUnreachableServerIsATransportFailure() {
         fails<TutaException.Transport>(TutaErrorCode.TRANSPORT_FAILED) { client.login("a@tuta.com", "password") }
         fails<TutaException.Transport>(TutaErrorCode.TRANSPORT_FAILED) { client.sync(session, limit = 10) }

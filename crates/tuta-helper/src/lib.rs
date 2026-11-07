@@ -8,7 +8,7 @@
 mod protocol;
 pub mod watch;
 
-use protocol::Request;
+use protocol::{Failure, Request};
 use serde_json::{json, Value};
 use tuta_unofficial_sdk::{Client, Error};
 
@@ -27,17 +27,21 @@ pub const MAX_REQUEST_BYTES: usize = 36 * 1024 * 1024;
 pub async fn respond(client: &Client, input: &[u8]) -> Value {
     let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
     let result = if input.len() > MAX_REQUEST_BYTES {
-        Err(Error::InvalidRequest)
+        Err(Error::InvalidRequest.into())
     } else {
         match serde_json::from_slice::<Request>(input) {
-            Ok(request) if request.version != VERSION => Err(Error::UnsupportedVersion),
+            Ok(request) if request.version != VERSION => Err(Error::UnsupportedVersion.into()),
             Ok(request) => protocol::dispatch(client, request.operation, deadline).await,
-            Err(_) => Err(Error::InvalidRequest),
+            Err(_) => Err(Error::InvalidRequest.into()),
         }
     };
     match result {
         Ok(result) => json!({"version": VERSION, "result": result}),
-        Err(code) => error_reply(code),
+        Err(Failure {
+            code,
+            pending_session: Some(pending),
+        }) => json!({"version": VERSION, "error": {"code": code, "pending_session": pending}}),
+        Err(Failure { code, .. }) => error_reply(code),
     }
 }
 
@@ -82,6 +86,19 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_second_factor_reply_carries_the_pending_session() {
+        let pending = json!({"login": "a@tuta.com", "user_id": "u",
+            "access_token": "AAECAwQFBgcICQoLDA0ODw", "encrypted_passphrase_key": [1, 2]});
+        let request = json!({"version": 1, "op": "login", "email": "a@tuta.com",
+            "password": "p", "pending_session": pending});
+        assert_eq!(
+            respond(&client(), request.to_string().as_bytes()).await,
+            json!({"version": 1, "error": {"code": "second_factor_required",
+                "pending_session": pending}})
+        );
     }
 
     #[tokio::test]

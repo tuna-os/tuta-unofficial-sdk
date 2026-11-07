@@ -59,3 +59,18 @@ class TutaSession private constructor(
         }
     }
 }
+
+/**
+ * A sign-in waiting for its second factor: the session Tuta opened for it,
+ * from [TutaException.pendingSession]. Pass it back to [TutaClient.login]
+ * with the code, so the code completes this session instead of opening
+ * another (Tuta throttles sign-ins). It is a credential: keep it in memory
+ * only, never persist or log it, and drop it when the address or password
+ * changes. An abandoned one expires on the server.
+ */
+class TutaPendingSession internal constructor(internal val element: JsonObject) {
+    /** The address the sign-in is for. */
+    val login: String = (element["login"] as? JsonPrimitive)?.content.orEmpty()
+
+    override fun toString(): String = "TutaPendingSession(<redacted>)"
+}

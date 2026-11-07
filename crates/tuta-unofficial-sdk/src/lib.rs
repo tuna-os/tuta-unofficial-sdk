@@ -74,7 +74,9 @@ mod watch;
 /// SDK and the bridge extensions chunk at this size.
 pub const MAIL_BATCH_LIMIT: usize = 50;
 
-pub use client::{Client, SavedSession, Session, DEFAULT_CLIENT_NAME, TUTA_URL};
+pub use client::{
+    Client, PendingSession, SavedSession, Session, SignInError, DEFAULT_CLIENT_NAME, TUTA_URL,
+};
 pub use delivery::{KeyProtocol, RecipientReport};
 pub use error::{Error, Result};
 pub use ids::Id;

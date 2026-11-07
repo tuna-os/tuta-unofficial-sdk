@@ -12,8 +12,8 @@ use tuta_unofficial_sdk::{
     contacts::{self, Passwords},
     drafts::{self, DraftRequest},
     Action, Client, Color, Error, FolderEdit, Id, ImportMessage, LabelChanges, LabelEdit, Name,
-    OutgoingAttachment, Page, Recipient, Result, SavedSession, SendRequest, Session, Thread,
-    MAIL_BATCH_LIMIT, MAX_IMPORT_BYTES,
+    OutgoingAttachment, Page, PendingSession, Recipient, Result, SavedSession, SendRequest,
+    Session, Thread, MAIL_BATCH_LIMIT, MAX_IMPORT_BYTES,
 };
 
 /// The protocol version every request and reply carries.
@@ -26,6 +26,9 @@ pub(crate) enum Operation {
         email: String,
         password: SecretString,
         totp: Option<String>,
+        /// The session a `second_factor_required` (or a refused code)
+        /// handed back: the code completes it instead of a new sign-in.
+        pending_session: Option<PendingSession>,
     },
     Sync {
         session: SavedSession,
@@ -345,13 +348,75 @@ pub(crate) async fn dispatch(
     client: &Client,
     operation: Operation,
     deadline: Instant,
-) -> Result<Value> {
-    if let Operation::Send(send) = operation {
-        return send_mail(client, *send, deadline).await;
-    }
-    tokio::time::timeout_at(deadline, run(client, operation))
+) -> Result<Value, Failure> {
+    match operation {
+        Operation::Send(send) => Ok(send_mail(client, *send, deadline).await?),
+        Operation::Login {
+            email,
+            password,
+            totp,
+            pending_session,
+        } => tokio::time::timeout_at(
+            deadline,
+            login(client, &email, &password, totp.as_deref(), pending_session),
+        )
         .await
-        .unwrap_or(Err(Error::Timeout))
+        .unwrap_or(Err(Error::Timeout.into())),
+        operation => Ok(tokio::time::timeout_at(deadline, run(client, operation))
+            .await
+            .unwrap_or(Err(Error::Timeout))?),
+    }
+}
+
+/// A failed request: its code and, for a sign-in waiting on its second
+/// factor, the session to retry the code on (`error.pending_session`).
+pub(crate) struct Failure {
+    pub(crate) code: Error,
+    pub(crate) pending_session: Option<PendingSession>,
+}
+
+impl From<Error> for Failure {
+    fn from(code: Error) -> Self {
+        Failure {
+            code,
+            pending_session: None,
+        }
+    }
+}
+
+/// `login`: a new sign-in, or with `pending_session` the second factor of
+/// one the server already opened. A pending session is for one address: a
+/// request naming another is refused before any I/O.
+async fn login(
+    client: &Client,
+    email: &str,
+    password: &SecretString,
+    totp: Option<&str>,
+    pending: Option<PendingSession>,
+) -> Result<Value, Failure> {
+    let signed_in = match pending {
+        Some(pending) => {
+            let normalized = |address: &str| address.trim().to_lowercase();
+            if normalized(pending.login()) != normalized(email) {
+                return Err(Error::InvalidRequest.into());
+            }
+            let Some(code) = totp else {
+                return Err(Failure {
+                    code: Error::SecondFactorRequired,
+                    pending_session: Some(pending),
+                });
+            };
+            client.complete_sign_in(pending, code).await
+        }
+        None => client.sign_in(email, password, totp).await,
+    };
+    match signed_in {
+        Ok(session) => Ok(json!({"session": session.saved()})),
+        Err(failure) => Err(Failure {
+            code: failure.code,
+            pending_session: failure.pending,
+        }),
+    }
 }
 
 /// A send's own time limit: a send that overran after its submit left must
@@ -396,14 +461,7 @@ async fn resume(client: &Client, saved: SavedSession) -> Result<Session> {
 
 async fn run(client: &Client, operation: Operation) -> Result<Value> {
     match operation {
-        Operation::Login {
-            email,
-            password,
-            totp,
-        } => {
-            let session = client.login(&email, &password, totp.as_deref()).await?;
-            Ok(json!({"session": session.saved()}))
-        }
+        Operation::Login { .. } => unreachable!("dispatch handles login"),
         Operation::Sync {
             session,
             folder,
@@ -928,15 +986,68 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                dispatch(&client, request(&body), far).await.err(),
+                dispatch(&client, request(&body), far)
+                    .await
+                    .err()
+                    .map(|f| f.code),
                 Some(code),
                 "{body}"
             );
         }
         let empty = format!(r#"{{"version":1,"op":"contact_passwords",{session},"addresses":[]}}"#);
         assert_eq!(
-            dispatch(&client, request(&empty), far).await.unwrap(),
+            dispatch(&client, request(&empty), far).await.ok().unwrap(),
             json!({"recipients": []})
         );
+    }
+
+    const PENDING: &str = r#"{"login":"Ada@Tuta.com","user_id":"u",
+        "access_token":"AAECAwQFBgcICQoLDA0ODw","encrypted_passphrase_key":[1,2]}"#;
+
+    #[tokio::test]
+    async fn a_pending_sign_in_is_checked_before_any_io_and_handed_back() {
+        let far = Instant::now() + REQUEST_TIMEOUT;
+        let client = Identity::HELPER.client().unwrap();
+        let login = |extra: &str| {
+            parse(&format!(
+                r#"{{"version":1,"op":"login","email":"ada@tuta.com","password":"p",
+                "pending_session":{PENDING}{extra}}}"#
+            ))
+            .unwrap()
+            .operation
+        };
+        let pending: Value = serde_json::from_str(PENDING).unwrap();
+        // No code yet: still waiting, same session back.
+        let failure = dispatch(&client, login(""), far).await.err().unwrap();
+        assert_eq!(failure.code, Error::SecondFactorRequired);
+        assert_eq!(
+            serde_json::to_value(failure.pending_session).unwrap(),
+            pending
+        );
+        // A malformed code: refused, same session back for the next try.
+        let failure = dispatch(&client, login(r#","totp":"12a""#), far)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, Error::InvalidTotp);
+        assert_eq!(
+            serde_json::to_value(failure.pending_session).unwrap(),
+            pending
+        );
+        // Another address cannot use it.
+        let other = parse(&format!(
+            r#"{{"version":1,"op":"login","email":"eve@tuta.com","password":"p",
+            "totp":"123456","pending_session":{PENDING}}}"#
+        ))
+        .unwrap()
+        .operation;
+        let failure = dispatch(&client, other, far).await.err().unwrap();
+        assert_eq!(failure.code, Error::InvalidRequest);
+        assert!(failure.pending_session.is_none());
+        // A pending session is a whole session object.
+        assert!(parse(
+            r#"{"version":1,"op":"login","email":"a","password":"p","pending_session":{"login":"a"}}"#
+        )
+        .is_err());
     }
 }
