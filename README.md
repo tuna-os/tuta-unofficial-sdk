@@ -8,7 +8,8 @@ changes. Tuta offers no IMAP, SMTP or JMAP: mail is end-to-end encrypted on
 the server, and only Tuta's own client library can sign in and decrypt it.
 This SDK wraps that library in a typed async API, and ships `tuta-helper`, a
 small JSON-over-stdio program on top of it for applications that would
-rather run a separate process.
+rather run a separate process, and `tuta-sdk-android`, the same protocol in
+process for Android and the JVM through Kotlin bindings.
 
 ## Status and disclaimer
 
@@ -24,8 +25,8 @@ SDK that falls behind the minimum client version Tuta accepts fails with
 `client_outdated`, and the fix is to update the pin, never to report a
 different client version.
 
-Version 0.1.0 is the first release: the API follows the needs of its first
-user, the Hylki mail client's Tuta support, and may still change.
+The API follows the needs of its users, the Hylki mail client's Tuta support
+and Tuna Mail for Android, and may still change before 1.0.
 
 ## Features
 
@@ -48,6 +49,9 @@ user, the Hylki mail client's Tuta support, and may still change.
 - Import of a MIME message into a folder, as the official desktop importer
   does (Legend and Unlimited plans).
 - Push: a stream of folder and mail changes from Tuta's event bus.
+- Android and the JVM: a Kotlin library (`org.tunaos.tuta:tuta-sdk-android`)
+  with typed data classes, coroutines and fixed-code exceptions over the
+  helper protocol, run in process through uniffi.
 
 ## Security model
 
@@ -87,6 +91,10 @@ patches:
   `set_preshared_password`, and `EntityClient::create_instance` reports a
   refused create as an error instead of panicking. It adds no
   cryptography.
+- `05-quiet-type-model-fetch.patch` drops the one line the SDK printed to
+  stdout (a progress note when the server's type model changes). A library
+  has no business on its caller's stdout: in process it lands wherever the
+  host uses fd 1, a JVM's `System.out` included.
 
 Secrets stay secrets: passwords, session tokens and wrapped keys are held in
 `secrecy`/`zeroize` types with no `Debug` form, never go in argv or the
@@ -126,7 +134,10 @@ verifies exactly what it compiles. The library builds only from `prepared/`.
 | --- | --- |
 | `crates/tuta-unofficial-sdk` | The library. |
 | `crates/tuta-unofficial-sdk/examples/read_mail.rs` | A small CLI: list the folders, read the newest mail. |
-| `crates/tuta-helper` | The `tuta-helper` binary: the JSON protocol below, a thin front end on the library. |
+| `crates/tuta-helper` | The `tuta-helper` binary: the JSON protocol below, a thin front end on the library. Its library target is the protocol itself, which `tuta-ffi` shares. |
+| `crates/tuta-ffi` | The protocol in process for Kotlin: uniffi bindings (`libtuta_ffi`), see [Android](#android-and-the-jvm). |
+| `crates/tuta-ffi-bindgen` | `uniffi-bindgen` at the revision `tuta-ffi` links, for the Kotlin bindings. |
+| `android/` | The Gradle build of `org.tunaos.tuta:tuta-sdk-android`: the AAR, the typed Kotlin layer, and its JVM tests. |
 | `sdk-patches/` | Our patches to the Tuta SDK, applied in name order. |
 | `prepare.sh` | Prepares the patched SDK in `prepared/` (gitignored). |
 | `upstream/` | The tutabridge submodule, with tutanota inside it. |
@@ -185,8 +196,9 @@ use `send_within`, which keeps the [outcome rules](#send-outcomes): an
 overrun before the submit left is `Timeout` (nothing was sent), after it the
 submit's own status decides.
 
-The SDK prints a line of progress to stdout now and then (the helper parks
-fd 1 while it runs; an in-process GUI can ignore it).
+Nothing in the library writes to stdout (the SDK's one progress line is
+patched out, see `05-quiet-type-model-fetch.patch`); diagnostics go to
+stderr only when switched on.
 
 ### Depending on it
 
@@ -200,7 +212,7 @@ it is not on crates.io. Three ways in:
 
   ```toml
   [dependencies]
-  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.1.0-vendored" }
+  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.2.0-vendored" }
   ```
 
   `scripts/vendor.sh` makes such a tag from a release tag. The plain tags
@@ -549,6 +561,127 @@ deleted) or the write failed, and the send has gone out either way. For mail
 the account sent to itself both copies share a Message-ID, and the server
 links the sent copy.
 
+## Android and the JVM
+
+`org.tunaos.tuta:tuta-sdk-android` runs the [helper protocol](#the-helper-protocol)
+in process: `crates/tuta-ffi` exposes it through
+[uniffi](https://github.com/mozilla/uniffi-rs) (at the revision the pinned
+Tuta SDK already links) as `libtuta_ffi`, loaded by JNA, and a hand-written
+Kotlin layer on top gives it types. Every request goes through the very
+code `tuta-helper` runs (`tuta_helper::respond`), so the parsing, the
+offline checks, the codes, the limits and the 90-second deadline are the
+same, and so are this README's protocol sections.
+
+Why the JSON contract rather than typed uniffi records: the protocol is
+already the checked, documented and tested surface, with the hylki-tuta
+call order of its checks; mirroring ~25 operations as uniffi records would
+make a second contract to keep in step with it. One `request` function keeps
+the native surface to four calls, lets a newer library add fields without
+breaking an older Kotlin layer (decoding ignores unknown fields and enum
+values), and costs a JSON encode per call, which is nothing beside the
+network round trip.
+
+### Using it
+
+The AAR holds `libtuta_ffi.so` for `arm64-v8a` and `x86_64`, the generated
+bindings and the Kotlin layer; minSdk 24. Each GitHub release carries it two
+ways:
+
+- `tuta-sdk-android-<version>-maven.zip`, a Maven repository with the AAR and
+  its POM, so Gradle resolves its dependencies (JNA, kotlinx-coroutines,
+  kotlinx-serialization). This is the one to use. Unzip it into the
+  consuming project, say as `third_party/maven/`, and add:
+
+  ```kotlin
+  // settings.gradle.kts
+  dependencyResolutionManagement {
+      repositories {
+          maven { url = uri("third_party/maven") }
+      }
+  }
+  // the module's build.gradle.kts
+  dependencies {
+      implementation("org.tunaos.tuta:tuta-sdk-android:0.2.0")
+  }
+  ```
+
+- `tuta-sdk-android-<version>.aar` alone, for `files(...)`; its
+  dependencies (`net.java.dev.jna:jna:5.19.1@aar`,
+  `kotlinx-coroutines-core`, `kotlinx-serialization-json`) are then yours to
+  declare.
+
+Neither needs credentials, unlike GitHub Packages, and both work in an
+offline or F-Droid build. The consumer rules keep JNA's and the bindings'
+classes from R8.
+
+```kotlin
+val tuta = TutaClient(clientName = "Tuna Mail") // the name Tuta lists sessions under
+val session = tuta.login(email, password, totp) // TutaSession; persist session.json encrypted
+val page = tuta.sync(session, limit = 50)        // folders, labels, the Inbox's newest 50
+val message = tuta.message(session, page.messages.first().header.id)
+tuta.watch(session).collect { event -> /* Ready, MailChanged(folder), ... */ }
+```
+
+| Kotlin | Protocol |
+| --- | --- |
+| `TutaClient(clientName)`, `close()` | one native client; calls may overlap |
+| `login`, `revoke`, `TutaSession.fromJson`/`.json` | `login`, `revoke`, the `session` object |
+| `sync`, `message`, `listLabels` | `sync`, `message`, `list_labels` |
+| `markRead`, `move`, `applyLabels`, `delete`, `emptyFolder` | the same, per-id `IdOutcome`/`MoveOutcome` |
+| `createFolder`, `renameFolder`, `deleteFolder`, `createLabel`, `updateLabel`, `deleteLabel` | the same |
+| `send(SendRequest)`, `saveDraft(DraftRequest)`, `deleteDraft` | `send`, `save_draft`, `delete_draft` |
+| `contactPasswords`, `storeContactPasswords`, `import` | the same |
+| `watch(session): Flow<TutaWatchEvent>` | `watch`; cancelling the flow stops it |
+| `rawRequest(json): String` | any request object, answered verbatim |
+
+A failure is a `TutaException`, a sealed class by family (`Session`,
+`Transport`, `Content`, `InvalidRequest`, `Send`, `Contacts`, `Folders`,
+`Delete`, `Drafts`, `Import`, `Watch`, and `Unknown` for a code this build
+does not know) whose `code` is a `TutaErrorCode`, one entry per
+[error code](#error-codes); its message is the code, never server text.
+Calls are main-safe suspend functions. Cancelling one abandons its result,
+not the operation, which runs to its end so a send is never cut off
+half-way.
+
+**Secrets.** The Rust side zeroes each request's bytes and each reply's
+JSON tree once used, keeps sessions and passwords in `secrecy` types as
+before, and neither prints nor logs. What crosses into the JVM (the reply
+string, `TutaSession.json`) cannot be zeroed there: keep sessions in
+encrypted storage and out of logs; `TutaSession`, `ContactPassword` and the
+request classes redact themselves in `toString`. On Android the library
+points rustls at the system CA store (`/apex/com.android.conscrypt/cacerts`,
+else `/system/etc/security/cacerts`) through `SSL_CERT_DIR` unless the
+process set `SSL_CERT_FILE` or `SSL_CERT_DIR` itself; user-installed CAs are
+not trusted.
+
+### Building it
+
+`android/` is a Gradle build (Gradle 9.7, AGP 9.5, Kotlin 2.4, JDK 21, the
+versions of the Tuna Mail fork that consumes it) that drives cargo itself:
+
+```sh
+sh prepare.sh
+cd android
+./gradlew :tuta-sdk-jvm:test        # JDK + cargo: the bindings against a host libtuta_ffi
+./gradlew :tuta-sdk-android:dist    # + Android SDK (platform 37, NDK 28.2.13676358), cargo-ndk 4,
+                                    #   rustup targets aarch64-linux-android, x86_64-linux-android
+```
+
+`dist` runs `cargo ndk -t arm64-v8a -t x86_64 -P 24 build --profile android
+-p tuta-ffi` (release, stripped), generates the bindings with
+`tuta-ffi-bindgen`, and writes the AAR and the zipped Maven repository to
+`android/tuta-sdk-android/build/dist/`. Without an Android SDK the
+`:tuta-sdk-android` module is left out, so the JVM tests run on a host with
+only a JDK and Rust. The [Tuna Mail build image](https://github.com/tuna-os/thunderbird-android/tree/main/tools/build-env)
+has every tool `dist` needs.
+
+The JVM tests (`android/tuta-sdk-jvm`) compile the same Kotlin sources for
+the host and check them against the real native parser, offline: the error
+code list against the library's, every operation's field names (each test
+request fails a check the Rust side runs before any I/O), error families,
+transport failures against a closed local port, watches that fail and that
+are cancelled, and lenient decoding.
+
 ## Building and testing
 
 With a Rust toolchain (1.84 or newer), a C compiler, Python 3 and git:
@@ -560,7 +693,7 @@ sh prepare.sh
 cargo build --locked
 cargo test --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo fmt -p tuta-unofficial-sdk -p tuta-helper --check
+cargo fmt -p tuta-unofficial-sdk -p tuta-helper -p tuta-ffi -p tuta-ffi-bindgen --check
 cargo deny check
 ```
 
@@ -577,8 +710,8 @@ TUTA_EMAIL=ada@tuta.com cargo run --example read_mail   # password on stdin
 
 ### Live tests
 
-The unit tests never touch the network. Two live tests, `#[ignore]`d and
-gated on `TUTA_LIVE=1`, run against Tuta's servers with a test account's
+The unit tests never touch the network. Three live tests, ignored by default
+and gated on `TUTA_LIVE=1`, run against Tuta's servers with a test account's
 `TUTA_LIVE_EMAIL`, `TUTA_LIVE_PASSWORD` and, when it has a second factor,
 `TUTA_LIVE_TOTP`:
 
@@ -586,6 +719,9 @@ gated on `TUTA_LIVE=1`, run against Tuta's servers with a test account's
 TUTA_LIVE=1 TUTA_LIVE_EMAIL=... TUTA_LIVE_PASSWORD=... TUTA_LIVE_TOTP=... \
     cargo test -p tuta-unofficial-sdk --test live -- --ignored
 TUTA_LIVE=1 ... cargo test -p tuta-helper --test live -- --ignored
+# android/tuta-sdk-jvm/.../LiveTest.kt: remove its @Ignore locally, then
+cd android && TUTA_LIVE=1 ... ./gradlew --no-daemon --no-configuration-cache \
+    :tuta-sdk-jvm:test --tests '*LiveTest*'
 ```
 
 The library's signs in once, lists folders and labels, resumes the saved
@@ -594,8 +730,11 @@ one confidential mail with an attachment to the account itself, reads the
 received copy back (body, attachment, MIME), marks it read, and deletes both
 copies for good before closing its session. The helper's signs in once
 through the binary, syncs, reads the newest mail through the `hylki-tuta`
-name and lists labels, then revokes the session; it sends nothing. A TOTP
-code is good for one sign-in: take a fresh one for each.
+name and lists labels, then revokes the session; it sends nothing. The
+Kotlin one signs in once through `TutaClient`, restores the session from its
+JSON, syncs the Inbox, reads the newest mail, lists labels, waits for the
+watch's `Ready`, then revokes the session and sees it refused; it sends
+nothing. A TOTP code is good for one sign-in: take a fresh one for each.
 
 ## Packaging
 
@@ -615,6 +754,12 @@ The binary is built as `tuta-helper`. A package that replaces Hylki's
 helper installs it (or a symlink to it) as `hylki-tuta`, for example
 `install -Dm755 target/release/tuta-helper /app/bin/tuta-helper` and
 `ln -s tuta-helper /app/bin/hylki-tuta`.
+
+The Android library is built by `android/` (see
+[Building it](#building-it)); for a tag `vX.Y.Z`, CI builds it, runs the
+JVM tests and attaches `tuta-sdk-android-X.Y.Z.aar` and
+`tuta-sdk-android-X.Y.Z-maven.zip` to the GitHub release. The version is the
+Cargo workspace's, read by the Gradle build.
 
 ## Patches policy
 
@@ -671,10 +816,15 @@ run the helper by hand to see it.
   runs: a new `watch` starts from the present.
 - Sessions are not refreshed. Each helper operation resumes the stored
   session, and a revoked or expired one means signing in again.
-- The SDK prints some progress to stdout. The helper parks fd 1 while it
-  runs; an in-process caller that needs a clean stdout must do the same.
+- On Android the pinned SDK sends its own `log` calls to logcat under the
+  `TutaSDK` tag: startup, key-cache and error notes from Tuta's code (an
+  error's Debug form among them), which this repository does not control.
+  This repository's own code logs nothing.
 
 ## License
 
 GPL-3.0-or-later (see `LICENSE`), as the Tuta SDK and tutabridge are. The
-helper runs as a separate program from its caller.
+helper runs as a separate program from its caller. The Android library does
+not: `libtuta_ffi` runs inside the app, so an app that ships
+`tuta-sdk-android` is a combined work under GPL-3.0-or-later (Apache-2.0
+code such as Thunderbird for Android's may be combined into it).
