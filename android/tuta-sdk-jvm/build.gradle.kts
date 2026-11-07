@@ -66,8 +66,9 @@ dependencies {
 tasks.test {
     dependsOn(cargoBuildHost)
     useJUnit()
-    // JNA loads libtuta_ffi from here.
+    // JNA loads libtuta_ffi from here; a rebuilt library reruns the tests.
     systemProperty("jna.library.path", hostLibraryDir.path)
+    inputs.file(hostLibrary).withPropertyName("hostLibrary").withPathSensitivity(PathSensitivity.NONE)
     // The live test reads TUTA_LIVE* from the environment the test JVM
     // inherits; they are never written to the build's configuration.
     testLogging {
