@@ -34,6 +34,18 @@ All notable changes to this project are listed here. The format follows
   inline`, and only the other attachments in `multipart/mixed`, as Tuna
   Mail's own MIME builder did. The boundaries are now
   `=_tuta-unofficial-sdk-mixed` and `=_tuta-unofficial-sdk-related`.
+- A smaller Android library (#8): `libtuta_ffi` exports only its own
+  symbols (`-Wl,--exclude-libs,ALL` from `crates/tuta-ffi/build.rs`), so
+  the Tuta SDK's unused uniffi bindings no longer keep its code alive, and
+  the AAR builds with a new `android` profile (`opt-level = "z"`, one
+  codegen unit, the cryptography crates at `opt-level = 3`). arm64-v8a
+  stripped: 17.96 MB to 7.59 MB; the AAR: 12.3 MB to 7.1 MB. The table is
+  in the README ("Library size"). The bindings are unchanged.
+
+### Fixed
+
+- The JVM tests rerun when the host library changes (it is a declared
+  input of the test task now).
 
 ## [0.2.1] - 2026-11-07
 
