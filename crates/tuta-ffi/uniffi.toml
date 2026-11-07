@@ -1,0 +1,9 @@
+# Kotlin bindings: scripts/android-build.sh generates them with
+# `uniffi-bindgen generate --library ... --crate tuta_ffi`.
+[bindings.kotlin]
+package_name = "org.tunaos.tuta.ffi"
+cdylib_name = "tuta_ffi"
+# The same generated sources serve Android and the host JVM tests; the JVM
+# cleaner falls back to JNA's own where java.lang.ref.Cleaner is missing
+# (Android before API 33).
+android = false

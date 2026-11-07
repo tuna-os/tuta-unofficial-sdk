@@ -1,0 +1,28 @@
+[package]
+name = "tuta-ffi"
+description = "uniffi bindings (Kotlin/JNA) for tuta-unofficial-sdk: the tuta-helper protocol in process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "tuta_ffi"
+# cdylib: libtuta_ffi.so for JNA (Android jniLibs, host JVM tests); lib: the
+# Rust tests.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+tuta-helper = { path = "../tuta-helper" }
+tuta-unofficial-sdk = { path = "../tuta-unofficial-sdk" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+# The pinned Tuta SDK already links uniffi at this revision (its own
+# bindings); one uniffi in the graph keeps a single scaffolding ABI.
+uniffi = { git = "https://github.com/mozilla/uniffi-rs.git", rev = "13a1c559cb3708eeca40dcf95dc8b3ccccf3b88c", default-features = false }
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
