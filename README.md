@@ -779,8 +779,8 @@ cd android
                                     #   rustup targets aarch64-linux-android, x86_64-linux-android
 ```
 
-`dist` runs `cargo ndk -t arm64-v8a -t x86_64 -P 24 build --release -p
-tuta-ffi`, keeps `libtuta_ffi.so` of what it copies (the Tuta SDK's own
+`dist` runs `cargo ndk -t arm64-v8a -t x86_64 -P 24 build --profile android
+-p tuta-ffi`, keeps `libtuta_ffi.so` of what it copies (the Tuta SDK's own
 cdylibs come along), generates the bindings from it with `tuta-ffi-bindgen`
 (which reads uniffi's metadata symbols, so AGP strips the library only
 when packaging), and writes the AAR and the zipped Maven repository to
@@ -795,6 +795,42 @@ code list against the library's, every operation's field names (each test
 request fails a check the Rust side runs before any I/O), error families,
 transport failures against a closed local port, watches that fail and that
 are cancelled, and lenient decoding.
+
+### Library size
+
+`libtuta_ffi` links the whole Tuta SDK, and a cdylib exports every
+`#[no_mangle]` symbol of every crate in it: the SDK's own uniffi bindings,
+some 700 functions and metadata statics nothing here calls, kept most of the
+SDK alive past the linker's section GC. Two things shrink it:
+
+- `crates/tuta-ffi/build.rs` links with `-Wl,--exclude-libs,ALL` (Android
+  and Linux), which makes the symbols of the dependencies' archives local so
+  the GC can drop what `tuta-ffi` does not reach. Its own uniffi functions
+  and metadata stay exported, so the generated bindings are unchanged.
+- The `android` profile in `Cargo.toml`: `opt-level = "z"` and one codegen
+  unit, with the cryptography crates (Argon2, AES, SHA, the curves,
+  ML-KEM, RSA, ring) kept at `opt-level = 3`, since Argon2 runs on every
+  sign-in.
+
+Measured on arm64-v8a, each step on top of the one before; "stripped" is
+what AGP packages (`llvm-strip --strip-unneeded`), "gzip -9" a stand-in for
+its compressed size in the AAR and the APK:
+
+| Build | Unstripped | Stripped | gzip -9 | Exported symbols |
+| --- | ---: | ---: | ---: | ---: |
+| `--release` (0.2.1) | 24.4 MB | 17.96 MB | 5.81 MB | 811 |
+| + `--exclude-libs,ALL` | 15.5 MB | 10.77 MB | 4.27 MB | 92 |
+| + `opt-level = "z"` everywhere | 18.7 MB | 9.23 MB | 3.95 MB | 92 |
+| + `"z"` but cryptography at 3 | 18.5 MB | 9.29 MB | 4.00 MB | 92 |
+| + `codegen-units = 1` (the `android` profile) | 14.6 MB | **7.59 MB** | **3.35 MB** | 92 |
+| + `lto = "fat"` | 14.6 MB | 7.58 MB | 3.34 MB | 92 |
+| (`--exclude-libs` + fat LTO, one unit, `opt-level = 3`) | 10.9 MB | 8.15 MB | 3.49 MB | 92 |
+
+Fat LTO saves nothing measurable on top of the profile and costs build
+time, so it is off. Stripping here instead of in AGP would save nothing more
+and lose the metadata the bindings are generated from. Altogether the AAR
+went from 12.3 MB (0.2.1) to 7.1 MB (0.3.0), with `libtuta_ffi` at 7.6 MB
+(arm64-v8a) and 9.0 MB (x86_64) stripped, 3.4 MB each compressed.
 
 ## Building and testing
 

@@ -12,3 +12,37 @@ edition = "2021"
 rust-version = "1.84"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tuna-os/tuta-unofficial-sdk"
+
+# The Android libraries (android/ builds libtuta_ffi with it). Measured on
+# arm64-v8a, stripped as AGP packages it (README, "Library size"): size-first
+# code for the cold crates and one codegen unit, with the cryptography at
+# full speed (Argon2 runs on every sign-in). Not stripped here: the bindings
+# are generated from this library's uniffi metadata, and AGP strips it when
+# packaging.
+[profile.android]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+
+[profile.android.package]
+aes.opt-level = 3
+argon2.opt-level = 3
+blake2.opt-level = 3
+blake3.opt-level = 3
+cbc.opt-level = 3
+chacha20.opt-level = 3
+crypto-primitives.opt-level = 3
+curve25519-dalek.opt-level = 3
+ed25519-dalek.opt-level = 3
+fiat-crypto.opt-level = 3
+keccak.opt-level = 3
+lz4_flex.opt-level = 3
+num-bigint-dig.opt-level = 3
+pqcrypto-internals.opt-level = 3
+pqcrypto-mlkem.opt-level = 3
+ring.opt-level = 3
+rsa.opt-level = 3
+sha1.opt-level = 3
+sha2.opt-level = 3
+sha3.opt-level = 3
+x25519-dalek.opt-level = 3

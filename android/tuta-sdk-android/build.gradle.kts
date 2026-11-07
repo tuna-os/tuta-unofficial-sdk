@@ -23,7 +23,10 @@ version = sdkVersion
 val abis = listOf("arm64-v8a", "x86_64")
 val minSdkVersion = 24
 
-/** libtuta_ffi for every ABI, laid out as jniLibs; cargo decides what is stale. */
+/**
+ * libtuta_ffi for every ABI, laid out as jniLibs; cargo decides what is
+ * stale. The `android` profile (Cargo.toml) builds it for size.
+ */
 abstract class CargoNdk : Exec() {
     /** Where cargo-ndk lays out every library cargo built. */
     @get:Internal
@@ -48,7 +51,7 @@ val cargoNdk = tasks.register<CargoNdk>("cargoNdk") {
         CommandLineArgumentProvider {
             listOf("ndk") + abiArgs + listOf(
                 "-P", platform, "-o", staging.get().asFile.path,
-                "build", "--locked", "--release", "-p", "tuta-ffi",
+                "build", "--locked", "--profile", "android", "-p", "tuta-ffi",
             )
         },
     )
