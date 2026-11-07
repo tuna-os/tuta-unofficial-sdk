@@ -25,23 +25,42 @@ val minSdkVersion = 24
 
 /** libtuta_ffi for every ABI, laid out as jniLibs; cargo decides what is stale. */
 abstract class CargoNdk : Exec() {
+    /** Where cargo-ndk lays out every library cargo built. */
+    @get:Internal
+    abstract val stagingDir: DirectoryProperty
+
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 }
 
 val cargoNdk = tasks.register<CargoNdk>("cargoNdk") {
     description = "Builds libtuta_ffi for ${abis.joinToString()} with cargo-ndk"
+    // Locals, so the actions below capture values rather than the script.
+    val abiArgs = abis.flatMap { listOf("-t", it) }
+    val platform = minSdkVersion.toString()
+    val staging = stagingDir
+    val output = outputDir
     workingDir = repoRoot
     executable = "cargo"
+    stagingDir.set(layout.buildDirectory.dir("intermediates/cargo-ndk"))
     outputDir.set(layout.buildDirectory.dir("generated/jniLibs"))
     argumentProviders.add(
         CommandLineArgumentProvider {
-            listOf("ndk") + abis.flatMap { listOf("-t", it) } + listOf(
-                "-P", minSdkVersion.toString(), "-o", outputDir.get().asFile.path,
-                "build", "--locked", "--profile", "android", "-p", "tuta-ffi",
+            listOf("ndk") + abiArgs + listOf(
+                "-P", platform, "-o", staging.get().asFile.path,
+                "build", "--locked", "--release", "-p", "tuta-ffi",
             )
         },
     )
+    doLast {
+        // cargo-ndk copies every cdylib cargo built, the Tuta SDK's own
+        // (libtutasdk, libcrypto_primitives) among them: ship libtuta_ffi only.
+        val jniLibs = output.get().asFile
+        jniLibs.deleteRecursively()
+        staging.get().asFile.walkTopDown()
+            .filter { it.isFile && it.name == "libtuta_ffi.so" }
+            .forEach { it.copyTo(jniLibs.resolve("${it.parentFile.name}/${it.name}")) }
+    }
     outputs.upToDateWhen { false }
 }
 
@@ -148,25 +167,25 @@ publishing {
     }
 }
 
-val mavenDir = layout.buildDirectory.dir("maven")
-
 tasks.matching { it.name == "publishReleasePublicationToDistRepository" }.configureEach {
     // Only this version goes in the zip.
-    doFirst { mavenDir.get().asFile.deleteRecursively() }
+    val repository = layout.buildDirectory.dir("maven")
+    doFirst { repository.get().asFile.deleteRecursively() }
 }
 
 val mavenZip = tasks.register<Zip>("mavenZip") {
     description = "Zips the Maven repository holding this release"
     dependsOn("publishReleasePublicationToDistRepository")
-    from(mavenDir)
+    from(layout.buildDirectory.dir("maven"))
     archiveFileName.set("tuta-sdk-android-$sdkVersion-maven.zip")
     destinationDirectory.set(layout.buildDirectory.dir("dist"))
 }
 
 tasks.register<Copy>("dist") {
     description = "Writes the release assets (AAR, zipped Maven repository) to build/dist"
+    val aarName = "tuta-sdk-android-$sdkVersion.aar"
     dependsOn(mavenZip)
     from(tasks.named("bundleReleaseAar"))
-    rename { "tuta-sdk-android-$sdkVersion.aar" }
+    rename { aarName }
     into(layout.buildDirectory.dir("dist"))
 }

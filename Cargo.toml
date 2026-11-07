@@ -12,8 +12,3 @@ edition = "2021"
 rust-version = "1.84"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tuna-os/tuta-unofficial-sdk"
-
-# The Android libraries (android/ builds them with it): release, stripped.
-[profile.android]
-inherits = "release"
-strip = true

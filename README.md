@@ -667,9 +667,11 @@ cd android
                                     #   rustup targets aarch64-linux-android, x86_64-linux-android
 ```
 
-`dist` runs `cargo ndk -t arm64-v8a -t x86_64 -P 24 build --profile android
--p tuta-ffi` (release, stripped), generates the bindings with
-`tuta-ffi-bindgen`, and writes the AAR and the zipped Maven repository to
+`dist` runs `cargo ndk -t arm64-v8a -t x86_64 -P 24 build --release -p
+tuta-ffi`, keeps `libtuta_ffi.so` of what it copies (the Tuta SDK's own
+cdylibs come along), generates the bindings from it with `tuta-ffi-bindgen`
+(which reads uniffi's metadata symbols, so AGP strips the library only
+when packaging), and writes the AAR and the zipped Maven repository to
 `android/tuta-sdk-android/build/dist/`. Without an Android SDK the
 `:tuta-sdk-android` module is left out, so the JVM tests run on a host with
 only a JDK and Rust. The [Tuna Mail build image](https://github.com/tuna-os/thunderbird-android/tree/main/tools/build-env)
