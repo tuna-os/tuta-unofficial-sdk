@@ -32,10 +32,14 @@
 //! # }
 //! ```
 //!
-//! - Sessions: [`Client::login`], [`Session::resume`], [`Session::saved`],
+//! - Sessions: [`Client::login`], [`Client::sign_in`] and
+//!   [`Client::complete_sign_in`] (a second factor),
+//!   [`Client::cancel_sign_in`], [`Session::resume`], [`Session::saved`],
 //!   [`Session::revoke`], [`Client::revoke`].
 //! - Reading: [`Session::folders`], [`Session::labels`], [`Session::sync`],
-//!   [`Session::message`] and [`Message::to_mime`].
+//!   [`Session::message`] and [`Message::to_mime`] (an `.eml`).
+//! - Searching: [`Session::search`], a bounded scan (see [`search`]: Tuta
+//!   has no server-side search).
 //! - Changing mail: [`Session::mark_read`], [`Session::move_mail`],
 //!   [`Session::delete`], [`Session::empty_folder`],
 //!   [`Session::apply_labels`].
@@ -65,6 +69,7 @@ mod import;
 mod mail;
 mod mailbox_ops;
 mod mime;
+pub mod search;
 mod send;
 mod thread;
 mod transport;
