@@ -4,6 +4,37 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (0.x: the API may still change).
 
+## [0.3.0] - 2026-11-07
+
+### Added
+
+- `search`: find mail by `keyword`, `subject`, `sender`, `recipient`,
+  received date (`after_ms`, `before_ms`) and read state, in one folder or
+  label or in every folder. Tuta has no server-side search on any plan, so
+  this is a bounded, resumable scan: each call examines at most 500 mails,
+  downloads at most 50 bodies (only for mails a header could not decide),
+  stops after 30 seconds or `limit` matches, and returns `next_cursor` to go
+  on from. Date bounds come from the entry ids, without loading mail
+  outside them (`Session::search`, the `search` module; Kotlin
+  `TutaClient.search`, `SearchQuery`, `SearchPage`). (#4)
+- `get_mime`: a mail rebuilt as RFC 5322 MIME, base64 on the wire, for
+  `.eml` export (Kotlin `TutaClient.getMime`). (#5)
+- `cancel_sign_in`: give up a sign-in waiting for its second factor; Tuta
+  drops the pending session instead of keeping it until it expires, and a
+  session whose code already went through is revoked
+  (`Client::cancel_sign_in`, Kotlin `TutaClient.cancelSignIn`).
+  `06-cancel-second-factor.patch` adds `Sdk::cancel_second_factor`, the
+  official client's unauthenticated `SecondFactorAuthService` DELETE. (#6)
+- Golden `.eml` files pin the MIME output (`testdata/mime`).
+
+### Changed
+
+- `Message::to_mime` puts inline images (attachments with a Content-ID) in
+  a `multipart/related` beside the HTML body, with `Content-Disposition:
+  inline`, and only the other attachments in `multipart/mixed`, as Tuna
+  Mail's own MIME builder did. The boundaries are now
+  `=_tuta-unofficial-sdk-mixed` and `=_tuta-unofficial-sdk-related`.
+
 ## [0.2.1] - 2026-11-07
 
 ### Fixed

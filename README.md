@@ -31,9 +31,11 @@ and Tuna Mail for Android, and may still change before 1.0.
 ## Features
 
 - Sign-in with password and TOTP; saved, resumable sessions; closing a
-  session on the server.
+  session on the server; cancelling a sign-in left at its second factor.
 - The folder tree and labels; folder pages with every mail's labels and
-  Message-ID; a mail decrypted to its parts or to RFC 5322 MIME.
+  Message-ID; a mail decrypted to its parts or to RFC 5322 MIME (`.eml`).
+- Search by text, sender, recipient, date and read state, as a bounded,
+  resumable scan (Tuta has no server-side search).
 - Read state, moves (with the server's own undo information), labels,
   permanent deletes from Trash and Spam, emptying Trash and Spam.
 - Folders and labels: create, rename, re-parent, recolour, delete, with the
@@ -61,7 +63,7 @@ release and commit [tutabridge](https://github.com/spartanz51/tutabridge)
 pins, with tutabridge's patches. This repository adds no cipher, key
 derivation or key exchange of its own: it composes the official client's
 service requests on top of the SDK, wraps symmetric keys only with the SDK's
-own AES functions, and exposes a few SDK internals through four small
+own AES functions, and exposes a few SDK internals through six small
 patches:
 
 - `01-recipient-key-data.patch` exposes
@@ -95,6 +97,11 @@ patches:
   stdout (a progress note when the server's type model changes). A library
   has no business on its caller's stdout: in process it lands wherever the
   host uses fd 1, a JVM's `System.out` included.
+- `06-cancel-second-factor.patch` adds `Sdk::cancel_second_factor`, the
+  official client's cancel of a sign-in waiting for its second factor
+  (`LoginFacade.cancelCreateSession`): an unauthenticated
+  `SecondFactorAuthService` DELETE naming the pending session, which the
+  server then drops. It adds no cryptography.
 
 Secrets stay secrets: passwords, session tokens and wrapped keys are held in
 `secrecy`/`zeroize` types with no `Debug` form, never go in argv or the
@@ -172,8 +179,9 @@ The API, all `async` on a tokio runtime:
 
 | Area | API |
 | --- | --- |
-| Sessions | `Client::new`, `Client::with_url`, `Client::client_name`, `Client::login(email, &SecretString, totp) -> Session`, `Client::sign_in` and `Client::complete_sign_in(PendingSession, totp)` (failing with a `SignInError` that may carry the `PendingSession`), `Session::resume(&client, SavedSession)`, `Session::saved`, `Session::revoke`, `Client::revoke(&SavedSession)` |
+| Sessions | `Client::new`, `Client::with_url`, `Client::client_name`, `Client::login(email, &SecretString, totp) -> Session`, `Client::sign_in` and `Client::complete_sign_in(PendingSession, totp)` (failing with a `SignInError` that may carry the `PendingSession`), `Client::cancel_sign_in(PendingSession)`, `Session::resume(&client, SavedSession)`, `Session::saved`, `Session::revoke`, `Client::revoke(&SavedSession)` |
 | Reading | `Session::folders`, `labels`, `sync(Option<&Id>, Page) -> SyncPage`, `message(&Id) -> Message`, `Message::to_mime() -> Vec<u8>` |
+| Search | `search::Search::new(SearchQuery, limit)`, `Session::search(Option<&Id>, &Search, Option<&SearchCursor>) -> SearchPage` (see [Search](#search)) |
 | Mail | `mark_read(&[Id], bool)`, `move_mail(&[Id], &Id)`, `delete(&[Id], &Id)`, `empty_folder(&Id)`, `apply_labels(&[Id], &LabelChanges)`; per-id `IdOutcome`/`MoveOutcome` rows |
 | Folders, labels | `create_folder(&Name, Option<&Id>)`, `rename_folder(&FolderEdit)`, `delete_folder(&Id) -> FolderDeletion`, `create_label(&Name, &Color)`, `update_label(&Id, &LabelEdit)`, `delete_label(&Id)` |
 | Sending | `send(SendRequest) -> SendOutcome`, `send_within(SendRequest, Duration)`; `Thread::new(in_reply_to, references, action)` |
@@ -185,7 +193,8 @@ The API, all `async` on a tokio runtime:
 
 Inputs that can be checked offline are typed and checked when built: `Id`,
 `Page`, `Name`, `Color`, `FolderEdit`, `LabelEdit`, `LabelChanges`,
-`Thread`, `ImportMessage`, `DraftRequest::check`. Every failure is an
+`Thread`, `ImportMessage`, `DraftRequest::check`, `Search`, `SearchCursor`.
+Every failure is an
 `Error`, a `#[non_exhaustive]` enum whose `code()` is the fixed snake_case
 code listed under [Error codes](#error-codes); `Error::from_code` maps a code
 back.
@@ -212,7 +221,7 @@ it is not on crates.io. Three ways in:
 
   ```toml
   [dependencies]
-  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.2.1-vendored" }
+  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.3.0-vendored" }
   ```
 
   `scripts/vendor.sh` makes such a tag from a release tag. The plain tags
@@ -262,8 +271,11 @@ Every request carries `version: 1` and an `op`:
 | Operation | Parameters | Result |
 | --- | --- | --- |
 | `login` | `email`, `password`, optional `totp`, optional `pending_session` (see [Two-factor sign-in](#two-factor-sign-in)) | Resumable `session` |
+| `cancel_sign_in` | `pending_session` | Empty object; closes the pending session on the server (see [Two-factor sign-in](#two-factor-sign-in)) |
 | `sync` | `session`, optional `folder`, `limit`, `offset` | Folder tree, labels, headers (each with its label ids and `message_id`), and the selected folder's full id snapshot when `offset` is zero |
 | `message` | `session`, compound `id` | Decrypted body, original headers, recipients and attachments; its header carries `message_id` too |
+| `get_mime` | `session`, compound `id` | `mime_base64`: the mail rebuilt as RFC 5322 MIME, standard base64 (see [Raw MIME](#raw-mime)) |
+| `search` | `session`, optional `folder`, optional `keyword`, `subject`, `sender`, `recipient`, `after_ms`, `before_ms`, `is_unread` (at least one), `limit` (1 to 100), optional `cursor` | `messages` (`sync` header rows plus their `folder`), `next_cursor` (null when complete) and `scanned` (see [Search](#search)) |
 | `mark_read` | `session`, `ids`, `is_read` | Per-id outcomes |
 | `move` | `session`, `ids`, compound `destination` | Per-id outcomes with `new_id` and `source` |
 | `send` | `session`, `sender`, `sender_name`, `to`, `cc`, `bcc`, `reply_tos`, `subject`, `body_html`, `attachments`, `confidential` (bool), `ordinary_confirmed`, optional `passwords` (`{address: password}`), optional `in_reply_to`, `references`, `action` (see [Replies and forwards](#replies-and-forwards)) | Server ids of the sent mail, recipient counts, the delivery mode, each Tuta recipient's key, `secure_external` and `contacts_saved` (see [Delivery](#delivery)); for a reply or forward, `parent_marked` |
@@ -314,8 +326,18 @@ throttles sign-ins (`rate_limited`), so the waiting session is handed back:
 
 The second form checks first whether the session still waits for its code,
 so a retry after a code that went through but a sign-in that did not finish
-completes it without the code being sent twice. An abandoned pending
-session cannot be cancelled through this SDK; it expires on the server.
+completes it without the code being sent twice.
+
+When the user gives up instead (cancels the code prompt, closes setup),
+send `cancel_sign_in` with the `pending_session`: Tuta drops the waiting
+session, as it does when the official client's code dialog is cancelled,
+rather than keeping it until it expires. A session whose code already went
+through is revoked instead, and one the server already let go counts as
+closed, so it is safe to call whatever state the sign-in reached. It fails
+with `transport_failed` (also while a code is being checked at that very
+moment), `rate_limited`, `timeout`, `client_outdated`, `session_invalid`
+(not a pending session) or `revoke_failed`; drop the `pending_session`
+either way.
 
 Per-id outcomes are `{"outcomes":[{"id","code"}]}` in request order, at most
 50 ids: `code` is null when applied, the failure's code for the batch that
@@ -394,6 +416,64 @@ keys, the same rules.
   recipients, subject, body and its whole attachment set. `delete_draft`
   discards a draft through Trash, never from Sent. Both refuse any id that is
   not a draft, and both treat a draft that is already gone as done.
+
+### Search
+
+Tuta has no server-side search on any plan: mail is end-to-end encrypted, so
+the server cannot read a subject, and Tuta's own apps build their search
+index on the device from mail they download and decrypt. This SDK keeps no
+index, so `search` scans: it walks the folder newest first, decrypts each
+mail's header (subject, sender, first recipient, received date, read flag)
+and downloads a body only when a criterion needs one.
+
+- Every criterion given must hold, and at least one is required. Text
+  criteria (`keyword`, `subject`, `sender`, `recipient`; at most 256
+  characters, not blank) are case-insensitive substrings. `keyword` looks
+  in the subject, the sender, all recipients and the body's text (HTML
+  tags, styles and scripts dropped); `recipient` in To, Cc and Bcc;
+  `sender` in the sender's name and address. `after_ms` (inclusive) and
+  `before_ms` (exclusive) bound the received date; `is_unread` the read
+  state. There are no stars to search for (`is_starred` is
+  `invalid_request`).
+- A body is fetched only for a mail that passed every header criterion and
+  still needs `keyword` or `recipient`, and only when the header alone did
+  not already match. Dates cost nothing: a folder's entries are ordered by
+  date, so `before_ms` starts the walk there and `after_ms` ends it.
+- Without `folder`, every folder is searched in the mailbox's order (labels
+  and the IMPORTED set left out, as their mail is in folders); with it, that
+  folder or label alone. Each hit names the `folder` it was found in.
+- One call stops at `limit` matches, 500 mails examined, 50 bodies fetched
+  or 30 seconds, whichever comes first, and answers `next_cursor`. Send the
+  same request again with `cursor` set to it to go on; `next_cursor` null
+  means the search is complete. A page can hold no match and still have a
+  cursor. The cursor is opaque and names a position, not a mail, so mail
+  that arrives or leaves meanwhile does not break it; it belongs to its
+  `folder`, and one from another folder is `invalid_request`.
+- A body that cannot be read (a legacy body, a decryption failure) leaves
+  that mail matched on its header alone. `invalid_page` is a `limit` out of
+  range, `invalid_request` a query without criteria, a blank or overlong
+  text, `after_ms` not before `before_ms`, or a malformed cursor, and
+  `folder_not_found` a `folder` that is not one.
+
+A search of a large mailbox is many calls and much traffic: a caller that
+searches often should keep its own index from `sync` and `message` and
+search that instead, as Tuta's own apps do.
+
+### Raw MIME
+
+Tuta keeps a mail's parts, not the message as it arrived, so `get_mime`
+(`Message::to_mime` in the library) rebuilds one: the HTML body, base64,
+inside `multipart/related` with the inline images (attachments with a
+Content-ID), inside `multipart/mixed` with the other attachments, each level
+only when it has parts to hold. Headers are Subject, From, Date, To, Cc,
+Reply-To, and from the original header block (mail from outside Tuta)
+Message-ID, In-Reply-To, References, List-Unsubscribe and
+List-Unsubscribe-Post; mail between Tuta accounts has no header block, so
+its Message-ID is the one Tuta keeps for it, and none is made up. Other
+original headers (Received, DKIM signatures) are not reproduced, so the
+result is a faithful `.eml` of the content, not the bytes the server got.
+The output is deterministic; golden files in
+`crates/tuta-unofficial-sdk/testdata/mime` pin it. Bcc is not included.
 
 ### Import
 
@@ -632,7 +712,7 @@ ways:
   }
   // the module's build.gradle.kts
   dependencies {
-      implementation("org.tunaos.tuta:tuta-sdk-android:0.2.1")
+      implementation("org.tunaos.tuta:tuta-sdk-android:0.3.0")
   }
   ```
 
@@ -656,8 +736,9 @@ tuta.watch(session).collect { event -> /* Ready, MailChanged(folder), ... */ }
 | Kotlin | Protocol |
 | --- | --- |
 | `TutaClient(clientName)`, `close()` | one native client; calls may overlap |
-| `login(email, password, totp, pending)`, `revoke`, `TutaSession.fromJson`/`.json` | `login` (`TutaException.pendingSession` is the `pending_session`), `revoke`, the `session` object |
-| `sync`, `message`, `listLabels` | `sync`, `message`, `list_labels` |
+| `login(email, password, totp, pending)`, `cancelSignIn(pending)`, `revoke`, `TutaSession.fromJson`/`.json` | `login` (`TutaException.pendingSession` is the `pending_session`), `cancel_sign_in`, `revoke`, the `session` object |
+| `sync`, `message`, `getMime` (bytes), `listLabels` | `sync`, `message`, `get_mime`, `list_labels` |
+| `search(session, SearchQuery, folder, limit, cursor): SearchPage` | `search` |
 | `markRead`, `move`, `applyLabels`, `delete`, `emptyFolder` | the same, per-id `IdOutcome`/`MoveOutcome` |
 | `createFolder`, `renameFolder`, `deleteFolder`, `createLabel`, `updateLabel`, `deleteLabel` | the same |
 | `send(SendRequest)`, `saveDraft(DraftRequest)`, `deleteDraft` | `send`, `save_draft`, `delete_draft` |
@@ -827,6 +908,8 @@ run the helper by hand to see it.
 
 - Two-factor sign-in supports TOTP only; U2F and WebAuthn keys are not
   supported.
+- Search is a bounded scan, not an index (see [Search](#search)): finding
+  everything in a large mailbox takes many calls.
 - Recipient keys are not verified (see Delivery).
 - Password-protected delivery is the official client's, with three
   differences. The notification to the recipient is always in English (the
