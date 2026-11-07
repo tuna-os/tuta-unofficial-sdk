@@ -3,7 +3,8 @@
 use crate::{
     diag,
     error::{
-        initiate_error, keeps_pending, resume_error, second_factor_error, unsupported_factor_code,
+        api_code, initiate_error, keeps_pending, resume_error, second_factor_error,
+        unsupported_factor_code,
     },
     transport, Error, Result,
 };
@@ -173,6 +174,48 @@ impl Client {
         totp: &str,
     ) -> Result<Session, SignInError> {
         self.second_factor(pending, totp, true).await
+    }
+
+    /// Give up a sign-in that is waiting for its second factor, closing the
+    /// session the server opened for it rather than leaving it to expire:
+    /// the official client's cancel (an unauthenticated
+    /// `SecondFactorAuthService` DELETE, `06-cancel-second-factor.patch`).
+    /// A session whose code already went in, so that nothing is pending any
+    /// more, is revoked instead. Idempotent: a session the server already
+    /// let go counts as closed.
+    ///
+    /// Fails with `transport_failed` (also while a code is being checked at
+    /// the same moment), `rate_limited`, `timeout`, `client_outdated`,
+    /// `session_invalid` for a malformed pending session, or
+    /// `revoke_failed`.
+    pub async fn cancel_sign_in(&self, pending: PendingSession) -> Result<()> {
+        let token = pending.0.access_token().to_string();
+        match self.sdk.cancel_second_factor(&token).await {
+            Ok(()) => Ok(()),
+            Err(LoginError::ApiCall {
+                source:
+                    ApiCallError::ServerResponseError {
+                        source:
+                            HttpError::NotFoundError
+                            | HttpError::NotAuthenticatedError
+                            | HttpError::SessionExpiredError
+                            | HttpError::AccessExpiredError
+                            | HttpError::AccessDeactivatedError,
+                    },
+            }) => match self.revoke(&pending.0).await {
+                // Gone is gone.
+                Err(Error::SessionRevoked) => Ok(()),
+                revoked => revoked,
+            },
+            Err(LoginError::ApiCall { source }) => {
+                diag::failed("sign-in cancel", &source);
+                Err(api_code(source, Error::RevokeFailed, Error::RevokeFailed))
+            }
+            Err(error) => {
+                diag::failed("sign-in cancel", &error);
+                Err(Error::SessionInvalid)
+            }
+        }
     }
 
     /// Submit `code` for `pending`, wait for the server to accept it, and
