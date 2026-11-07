@@ -1,0 +1,35 @@
+Subject: =?utf-8?b?R3LDvMOfZSwgQWRh?=
+From: "Ada L." <ada@tuta.com>
+Date: Tue, 14 Nov 2023 22:13:20 +0000
+To: bo@example.org
+Reply-To: Ada <ada+r@tuta.com>
+Message-ID: <orig@example.org>
+In-Reply-To: <parent@example.org>
+References: <root@example.org> <parent@example.org>
+List-Unsubscribe: <mailto:u@example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="=_tuta-unofficial-sdk-mixed"
+
+--=_tuta-unofficial-sdk-mixed
+Content-Type: multipart/related; boundary="=_tuta-unofficial-sdk-related"; type="text/html"
+
+--=_tuta-unofficial-sdk-related
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: base64
+
+PHA+aGk8L3A+
+--=_tuta-unofficial-sdk-related
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-Disposition: inline; filename="logo.png"
+Content-ID: <logo@tuta>
+
+iVBORw0KGgo=
+--=_tuta-unofficial-sdk-related--
+--=_tuta-unofficial-sdk-mixed
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename*=utf-8''Bericht%20%C3%A4.pdf
+
+JVBERi0xLjcK
+--=_tuta-unofficial-sdk-mixed--

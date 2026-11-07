@@ -1,16 +1,26 @@
 //! A decrypted [`Message`] as an RFC 5322 MIME message, so it reads through
-//! the same parser as any other account's mail.
+//! the same parser as any other account's mail, and exports as `.eml`.
+//!
+//! Tuta keeps a mail's parts, not the message as it arrived, so the message
+//! is rebuilt from them: the HTML body, inside `multipart/related` with the
+//! inline images (attachments with a Content-ID), inside `multipart/mixed`
+//! with the other attachments; each level only when it has parts to hold.
+//! This is the layout Tuna Mail's `backend/tuta` built on its own before.
 //!
 //! The original Message-ID, In-Reply-To, References and List-Unsubscribe
 //! headers are kept when the header block has them. Mail between Tuta
 //! accounts has no header block, so its Message-ID is the one Tuta keeps for
 //! it (the header's `message_id`): the id Tuta's own app answers it by. None
-//! is ever made up.
+//! is ever made up. The output is deterministic: the same parts always give
+//! the same bytes.
 
 use crate::mail::{Address, Attachment, Message};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
-const BOUNDARY: &str = "=_tuta-unofficial-sdk-part";
+// Fixed boundaries are safe: every body is base64, whose alphabet has
+// neither `-` nor `_`, and neither boundary is a prefix of the other.
+const MIXED_BOUNDARY: &str = "=_tuta-unofficial-sdk-mixed";
+const RELATED_BOUNDARY: &str = "=_tuta-unofficial-sdk-related";
 
 /// Header text with any line break flattened: message data never gets to
 /// start a header of its own.
@@ -168,27 +178,49 @@ fn rfc2822_date(ms: u64) -> String {
     )
 }
 
-fn attachment_part(attachment: &Attachment) -> String {
+/// The Content-ID an attachment carries, bare, when it has one: what makes
+/// it an inline part of the HTML body.
+fn content_id(attachment: &Attachment) -> Option<String> {
+    let cid = header_safe(attachment.cid.as_deref()?);
+    let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
+    (!cid.is_empty()).then(|| cid.to_string())
+}
+
+fn attachment_part(attachment: &Attachment, cid: Option<&str>) -> String {
     let filename = if attachment.name.is_empty() {
         "attachment"
     } else {
         attachment.name.as_str()
     };
+    let disposition = if cid.is_some() {
+        "inline"
+    } else {
+        "attachment"
+    };
     let mut part = format!(
-        "Content-Type: {}\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; {}\r\n",
+        "Content-Type: {}\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: {disposition}; {}\r\n",
         mime_type(attachment.mime_type.as_deref()),
         filename_parameter(&header_safe(filename)),
     );
-    if let Some(cid) = &attachment.cid {
-        let cid = header_safe(cid);
-        let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
-        if !cid.is_empty() {
-            part.push_str(&format!("Content-ID: <{cid}>\r\n"));
-        }
+    if let Some(cid) = cid {
+        part.push_str(&format!("Content-ID: <{cid}>\r\n"));
     }
     part.push_str("\r\n");
     part.push_str(&base64_lines(&attachment.data));
     part
+}
+
+/// A multipart body: its Content-Type line with `parameters`, then each
+/// part after a delimiter, then the close delimiter.
+fn multipart(subtype: &str, boundary: &str, parameters: &str, parts: &[String]) -> String {
+    let mut body =
+        format!("Content-Type: multipart/{subtype}; boundary=\"{boundary}\"{parameters}\r\n\r\n");
+    for part in parts {
+        body.push_str(&format!("--{boundary}\r\n"));
+        body.push_str(part);
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    body
 }
 
 /// The Message-ID Tuta keeps for the mail, when it is one: printable ASCII
@@ -204,8 +236,9 @@ fn kept_message_id(message_id: Option<&str>) -> Option<&str> {
 }
 
 impl Message {
-    /// The message as RFC 5322 MIME: the HTML body base64-encoded, and each
-    /// attachment a part of a `multipart/mixed` beside it.
+    /// The message as RFC 5322 MIME (an `.eml` file): the HTML body
+    /// base64-encoded, the inline images beside it in `multipart/related`,
+    /// the other attachments around both in `multipart/mixed`.
     pub fn to_mime(&self) -> Vec<u8> {
         let header = &self.header;
         let mut head = String::new();
@@ -245,25 +278,29 @@ impl Message {
                 }
             }
         }
-        let html_part = format!(
+        let mut body = format!(
             "Content-Type: text/html; charset=\"utf-8\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
             base64_lines(self.html.as_bytes())
         );
+        let mut inline = Vec::new();
+        let mut attached = Vec::new();
+        for attachment in &self.attachments {
+            match content_id(attachment) {
+                Some(cid) => inline.push(attachment_part(attachment, Some(&cid))),
+                None => attached.push(attachment_part(attachment, None)),
+            }
+        }
+        if !inline.is_empty() {
+            inline.insert(0, body);
+            body = multipart("related", RELATED_BOUNDARY, "; type=\"text/html\"", &inline);
+        }
+        if !attached.is_empty() {
+            attached.insert(0, body);
+            body = multipart("mixed", MIXED_BOUNDARY, "", &attached);
+        }
         let mut raw = head;
         raw.push_str("MIME-Version: 1.0\r\n");
-        if self.attachments.is_empty() {
-            raw.push_str(&html_part);
-            return raw.into_bytes();
-        }
-        raw.push_str(&format!(
-            "Content-Type: multipart/mixed; boundary=\"{BOUNDARY}\"\r\n\r\n"
-        ));
-        raw.push_str(&format!("--{BOUNDARY}\r\n{html_part}"));
-        for attachment in &self.attachments {
-            raw.push_str(&format!("--{BOUNDARY}\r\n"));
-            raw.push_str(&attachment_part(attachment));
-        }
-        raw.push_str(&format!("--{BOUNDARY}--\r\n"));
+        raw.push_str(&body);
         raw.into_bytes()
     }
 }
@@ -272,7 +309,7 @@ impl Message {
 mod tests {
     use super::*;
     use crate::{mail::MailHeader, Id};
-    use mail_parser::MessageParser;
+    use mail_parser::{MessageParser, MimeHeaders};
 
     fn address(name: &str, address: &str) -> Address {
         Address {
@@ -361,5 +398,93 @@ mod tests {
         let text = String::from_utf8(evil.to_mime()).unwrap();
         assert!(!text.contains("\r\nBcc:"));
         assert!(!text.contains("Message-ID"));
+    }
+
+    fn logo() -> Attachment {
+        Attachment {
+            name: "logo.png".into(),
+            mime_type: Some("image/png".into()),
+            cid: Some("logo@tuta".into()),
+            data: b"\x89PNG\r\n\x1a\n".to_vec(),
+        }
+    }
+
+    fn report() -> Attachment {
+        Attachment {
+            name: "Bericht ä.pdf".into(),
+            mime_type: Some("application/pdf".into()),
+            cid: None,
+            data: b"%PDF-1.7\n".to_vec(),
+        }
+    }
+
+    /// The three layouts, byte for byte, against the files in
+    /// `testdata/mime`. `TUTA_UPDATE_GOLDEN=1 cargo test` rewrites them; a
+    /// change to them is a change to every exported `.eml`, so review it.
+    #[test]
+    fn golden_messages() {
+        let external = "Received: from x\r\nMessage-ID: <orig@example.org>\r\nIn-Reply-To: <parent@example.org>\r\nReferences: <root@example.org>\r\n\t<parent@example.org>\r\nList-Unsubscribe: <mailto:u@example.org>\r\nSubject: ignored\r\n";
+        let mut related = message("", Some("kept@tuta.com"), vec![logo()]);
+        related.html = "<p><img src=\"cid:logo@tuta\"></p>".into();
+        let cases = [
+            (
+                "tuta-plain.eml",
+                message("", Some("abc@tuta.com"), Vec::new()),
+            ),
+            ("inline-image.eml", related),
+            (
+                "external-mixed.eml",
+                message(external, Some("kept@tuta.com"), vec![logo(), report()]),
+            ),
+        ];
+        let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/mime");
+        for (name, case) in cases {
+            let raw = case.to_mime();
+            let path = folder.join(name);
+            if std::env::var_os("TUTA_UPDATE_GOLDEN").is_some() {
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(&path, &raw).unwrap();
+                continue;
+            }
+            let golden = std::fs::read(&path).unwrap();
+            assert!(raw == golden, "{name} differs from its golden file");
+            // Every golden message reads back.
+            let parsed = MessageParser::default().parse(&raw).unwrap();
+            assert_eq!(parsed.subject(), Some("Grüße, Ada"));
+        }
+    }
+
+    #[test]
+    fn inline_images_are_related_and_attachments_mixed() {
+        let raw = message("", None, vec![report(), logo()]).to_mime();
+        let parsed = MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(parsed.content_type().unwrap().subtype(), Some("mixed"));
+        let text = String::from_utf8(raw.clone()).unwrap();
+        let related = text.find("Content-Type: multipart/related").unwrap();
+        let html = text.find("Content-Type: text/html").unwrap();
+        let image = text.find("Content-Type: image/png").unwrap();
+        let pdf = text.find("Content-Type: application/pdf").unwrap();
+        // mixed[related[html, image], pdf], the PDF last although it came first.
+        assert!(related < html && html < image && image < pdf);
+        assert!(text.contains(
+            "Content-Disposition: inline; filename=\"logo.png\"\r\nContent-ID: <logo@tuta>\r\n"
+        ));
+        assert!(text.contains(
+            "Content-Disposition: attachment; filename*=utf-8''Bericht%20%C3%A4.pdf\r\n"
+        ));
+        assert_eq!(parsed.body_html(0).as_deref(), Some("<p>hi</p>"));
+        let names: Vec<_> = parsed.attachments().map(|a| a.attachment_name()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&Some("logo.png")) && names.contains(&Some("Bericht ä.pdf")));
+    }
+
+    #[test]
+    fn a_blank_content_id_is_an_ordinary_attachment() {
+        let mut blank = logo();
+        blank.cid = Some(" <> ".into());
+        let text = String::from_utf8(message("", None, vec![blank]).to_mime()).unwrap();
+        assert!(!text.contains("multipart/related"));
+        assert!(!text.contains("Content-ID"));
+        assert!(text.contains("Content-Disposition: attachment;"));
     }
 }
