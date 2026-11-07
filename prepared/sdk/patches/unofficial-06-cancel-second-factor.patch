@@ -1,0 +1,78 @@
+Cancel a sign-in waiting for its second factor (tuta-unofficial-sdk)
+
+A sign-in that the user abandons at the second-factor prompt leaves its
+session open on the server until it expires. The official client closes it
+from SecondFactorAuthDialog through LoginFacade.cancelCreateSession: a
+SecondFactorAuthService DELETE naming the pending session, sent without
+authentication, since the session cannot authenticate anything before its
+second factor is through. The SDK has the generated DELETE binding but no
+call that makes it.
+
+Sdk::cancel_second_factor makes it, from the pending session's access token
+(parsed as authenticate_with_second_factor_totp parses it), on the same
+unauthenticated service executor the other second-factor calls use. Like
+TS, it leaves NotFoundError (nothing pending any more) and LockedError (a
+code being checked at the same moment) to the caller.
+
+diff --git a/tuta-sdk/rust/sdk/src/login/session.rs b/tuta-sdk/rust/sdk/src/login/session.rs
+index d09fa58..0d7f5e5 100644
+--- a/tuta-sdk/rust/sdk/src/login/session.rs
++++ b/tuta-sdk/rust/sdk/src/login/session.rs
+@@ -3,7 +3,7 @@ use crate::crypto::crypto_facade::create_auth_verifier;
+ use crate::entities::entity_facade::EntityFacadeImpl;
+ use crate::entities::generated::sys::{
+ 	Challenge, CreateSessionData, CreateSessionReturn, SaltData, SecondFactorAuthData,
+-	SecondFactorAuthGetData,
++	SecondFactorAuthDeleteData, SecondFactorAuthGetData,
+ };
+ use crate::login::login_facade::{derive_user_passphrase_key, parse_session_id, KdfType};
+ use crate::login::{CredentialType, Credentials, LoginError};
+@@ -142,6 +142,30 @@ impl Sdk {
+ 	}
+ }
+ impl Sdk {
++	/// Cancels a sign-in that is waiting for its second factor, as the
++	/// official client's `LoginFacade.cancelCreateSession` does: an
++	/// unauthenticated `SecondFactorAuthService` DELETE naming the pending
++	/// session, which the server then drops. The caller decides what a
++	/// `NotFoundError` (no second factor pending any more) or a `LockedError`
++	/// (a code being checked at the same moment) means.
++	pub async fn cancel_second_factor(&self, access_token: &str) -> Result<(), LoginError> {
++		let session_id =
++			parse_session_id(access_token).map_err(|e| LoginError::InvalidAccessToken {
++				error_message: format!("{e}"),
++			})?;
++		let service_executor = self.make_unauthenticated_service_executor();
++		service_executor
++			.delete::<SecondFactorAuthService>(
++				SecondFactorAuthDeleteData {
++					_format: 0,
++					session: session_id,
++				},
++				ExtraServiceParams::default(),
++			)
++			.await?;
++		Ok(())
++	}
++
+ 	fn make_unauthenticated_service_executor(&self) -> ServiceExecutor {
+ 		let headers_provider = Arc::new(HeadersProvider::new(None));
+ 		let entity_facade = Arc::new(EntityFacadeImpl::new(
+@@ -192,4 +216,17 @@ mod tests {
+ 			"expected InvalidAccessToken, got: {err:?}",
+ 		);
+ 	}
++
++	#[tokio::test]
++	async fn cancel_second_factor_rejects_invalid_access_token() {
++		let sdk = make_test_sdk();
++		let err = sdk
++			.cancel_second_factor("not-base64!")
++			.await
++			.expect_err("must reject invalid access token");
++		assert!(
++			matches!(err, LoginError::InvalidAccessToken { .. }),
++			"expected InvalidAccessToken, got: {err:?}",
++		);
++	}
+ }

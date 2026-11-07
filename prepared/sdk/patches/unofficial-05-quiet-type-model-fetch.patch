@@ -1,0 +1,29 @@
+Drop the type-model fetch's progress line on stdout (Tuna Mail)
+
+TypeModelProvider::fetch_server_model prints "Attempting to get base model
+version?" to stdout whenever the server's type model hash changes. A library
+has no business on its caller's stdout: it corrupts the reply line of a
+stdio helper, and in process it lands in whatever the host process uses fd 1
+for (a JVM's System.out under the Kotlin bindings). The line carries nothing
+the SDK's own log calls do not, so it is removed rather than redirected.
+
+diff --git a/tuta-sdk/rust/sdk/src/type_model_provider.rs b/tuta-sdk/rust/sdk/src/type_model_provider.rs
+index a0a1a62..635f0e5 100644
+--- a/tuta-sdk/rust/sdk/src/type_model_provider.rs
++++ b/tuta-sdk/rust/sdk/src/type_model_provider.rs
+@@ -207,15 +207,6 @@ impl TypeModelProvider {
+ 		let service_path = ApplicationTypesService::PATH;
+ 		let url = format!("{}/rest/{}", self.base_url, service_path);
+ 
+-		println!(
+-			"Attempting to get base model version?  {}",
+-			CLIENT_TYPE_MODEL
+-				.apps
+-				.get(&AppName::Base)
+-				.expect("base application not found")
+-				.version
+-				.clone()
+-		);
+ 		let headers = HashMap::from([
+ 			("cv".to_owned(), CLIENT_VERSION.to_string()),
+ 			(
