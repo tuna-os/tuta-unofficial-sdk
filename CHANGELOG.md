@@ -4,6 +4,27 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (0.x: the API may still change).
 
+## [0.2.1] - 2026-11-07
+
+### Fixed
+
+- A sign-in with a second factor no longer opens a second session for the
+  code. `login` without a code used to drop the session Tuta had opened, so
+  the retry with the code started another sign-in, which Tuta throttles
+  (seen as "could not reach the server"). The `second_factor_required` error
+  now carries `pending_session`, and `login` with `pending_session` and
+  `totp` completes that session (`Client::sign_in`,
+  `Client::complete_sign_in`, `PendingSession`, `SignInError`; Kotlin
+  `TutaException.pendingSession`, `TutaClient.login(..., pending)`). A
+  refused or malformed code, an outage or throttling hands it back again.
+
+### Added
+
+- `rate_limited`: Tuta throttling (HTTP 429, or too many wrong
+  second-factor codes), wherever it used to read as `transport_failed`,
+  the watch included.
+- `pending_session_expired`: a pending sign-in the server let go.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

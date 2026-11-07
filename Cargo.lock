@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "tuta-ffi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2524,14 +2524,14 @@ dependencies = [
 
 [[package]]
 name = "tuta-ffi-bindgen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "uniffi",
 ]
 
 [[package]]
 name = "tuta-helper"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "futures-core",
@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "tuta-unofficial-sdk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
