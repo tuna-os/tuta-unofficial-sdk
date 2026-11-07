@@ -1,0 +1,737 @@
+From 20f7781b01389e656c60d4383d9599e8030d4048 Mon Sep 17 00:00:00 2001
+From: spartanz51 <5300987+spartanz51@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 12:10:00 +0200
+Subject: [PATCH] [sdk] Resolve the session keys a bucket names for an entity's
+ children
+
+A received mail's bucket carries one encrypted session key per instance:
+the mail, its details and its attachments. resolve_session_key kept only
+the entity's own entry; the children's keys were decrypted and thrown
+away, and a File without an owner-encrypted key of its own could not be
+read until an official client had written one. TS reads them in memory
+(MailFacade.loadAttachments, resolveWithBucketKey).
+
+The decapsulation and the decryption of every entry move to a shared
+decrypt_bucket; resolve_bucket_key keeps its selection and wrapping.
+resolve_bucket_instance_keys decapsulates once and returns the keys of
+the requested children, matched on their full id, each wrapped with the
+current key of the parent's owner group as the TS does, and refuses a
+missing or duplicated entry. A groupEncBucketKey (secure external) is an
+error on both paths instead of a panic; it is still not implemented.
+---
+ tuta-sdk/rust/sdk/src/crypto/crypto_facade.rs | 536 ++++++++++++++++--
+ .../rust/sdk/src/entities/entity_facade.rs    |   5 +-
+ .../entities/entity_facade/decryption_keys.rs |  90 +++
+ 3 files changed, 582 insertions(+), 49 deletions(-)
+
+diff --git a/tuta-sdk/rust/sdk/src/crypto/crypto_facade.rs b/tuta-sdk/rust/sdk/src/crypto/crypto_facade.rs
+index d141d69d7b..68364fec7b 100644
+--- a/tuta-sdk/rust/sdk/src/crypto/crypto_facade.rs
++++ b/tuta-sdk/rust/sdk/src/crypto/crypto_facade.rs
+@@ -19,7 +19,7 @@ use crate::instance_mapper::InstanceMapper;
+ #[cfg_attr(test, mockall_double::double)]
+ use crate::key_loader_facade::KeyLoaderFacade;
+ use crate::metamodel::TypeModel;
+-use crate::tutanota_constants::{CryptoProtocolVersion, EncryptionAuthStatus, PermissionType};
++use crate::tutanota_constants::{CryptoProtocolVersion, PermissionType};
+ #[cfg_attr(test, mockall_double::double)]
+ use crate::user_facade::UserFacade;
+ use crate::util::convert_version_to_u64;
+@@ -285,58 +285,29 @@ impl CryptoFacade {
+ 			});
+ 		};
+ 
+-		let mut _auth_status: Option<EncryptionAuthStatus> = None; // TODO: implement
+-		let DecapsulatedAesKey {
+-			decrypted_aes_key: decrypted_bucket_key,
+-			sender_identity_pub_key,
+-		} = if let (Some(key_group), Some(pub_enc_bucket_key)) =
+-			(&bucket_key.keyGroup, &bucket_key.pubEncBucketKey)
+-		{
+-			self.asymmetric_crypto_facade
+-				.load_key_pair_and_decrypt_sym_key(
+-					key_group,
+-					convert_version_to_u64(bucket_key.recipientKeyVersion),
+-					&CryptoProtocolVersion::try_from(bucket_key.protocolVersion).unwrap(),
+-					pub_enc_bucket_key,
+-				)
+-				.await?
+-		} else if let Some(_group_enc_bucket_key) = &bucket_key.groupEncBucketKey {
+-			// TODO: to be used with secure external
+-			let _key_group = bucket_key.keyGroup.as_ref().unwrap_or(owner_group);
+-			_auth_status = Some(EncryptionAuthStatus::AESNoAuthentication);
+-			todo!("secure external resolveWithGroupReference")
+-		} else {
+-			return Err(SessionKeyResolutionError {
+-				reason: format!(
+-					"encrypted bucket key not set on instance {}/{}",
+-					type_model.app, type_model.name
+-				),
+-			});
+-		};
+-
+-		let mut session_key_for_this_instance = None;
+-
+-		for instance_session_key in bucket_key.bucketEncSessionKeys {
+-			let decrypted_session_key = decrypted_bucket_key
+-				.decrypt_aes_key(instance_session_key.symEncSessionKey.as_slice())?;
+-
+-			let id_attribute_id: String = type_model
+-				.get_attribute_id_by_attribute_name(ID_FIELD)
+-				.map_err(|err| SessionKeyResolutionError {
++		let id_attribute_id: String = type_model
++			.get_attribute_id_by_attribute_name(ID_FIELD)
++			.map_err(|err| SessionKeyResolutionError {
+ 				reason: format!(
+ 					"{ID_FIELD} attribute does not exist on the type model with typeId {:?} {:?}",
+ 					type_model.id, err
+ 				),
+ 			})?;
++		let instance_id = parse_generated_id_field(entity.get(&id_attribute_id))?;
+ 
+-			let instance_id = parse_generated_id_field(entity.get(&id_attribute_id))?;
+-
+-			if &instance_session_key.instanceId == instance_id {
+-				session_key_for_this_instance = Some(decrypted_session_key.clone());
+-			}
+-		}
+-
+-		let Some(session_key) = session_key_for_this_instance else {
++		let bucket = self
++			.decrypt_bucket(&bucket_key)
++			.await
++			.map_err(DecryptBucketError::into_resolution_error)?;
++
++		// The entity's own entry, matched on its element id, the last one winning.
++		let Some(session_key) = bucket
++			.instance_keys
++			.iter()
++			.rev()
++			.find(|key| &key.instance_id == instance_id)
++			.map(|key| key.session_key.clone())
++		else {
+ 			return Err(SessionKeyResolutionError {
+ 				reason: "no session key found in bucket key for this instance".to_string(),
+ 			});
+@@ -356,9 +327,154 @@ impl CryptoFacade {
+ 			session_key,
+ 			owner_enc_session_key,
+ 			owner_key_version: versioned_owner_group_key.version,
++			sender_identity_pub_key: bucket.sender_identity_pub_key,
++		})
++	}
++
++	/// Decapsulates the bucket key and decrypts every session key the bucket
++	/// carries, in bucket order, without choosing one: the callers select.
++	/// A `groupEncBucketKey` (secure external) is reported, not implemented.
++	async fn decrypt_bucket(
++		&self,
++		bucket_key: &BucketKey,
++	) -> Result<DecryptedBucket, DecryptBucketError> {
++		let DecapsulatedAesKey {
++			decrypted_aes_key: bucket_aes_key,
++			sender_identity_pub_key,
++		} = if let (Some(key_group), Some(pub_enc_bucket_key)) =
++			(&bucket_key.keyGroup, &bucket_key.pubEncBucketKey)
++		{
++			let protocol_version = CryptoProtocolVersion::try_from(bucket_key.protocolVersion)
++				.map_err(|_| {
++					DecryptBucketError::Resolution(SessionKeyResolutionError {
++						reason: "unknown crypto protocol version on bucket key".to_string(),
++					})
++				})?;
++			self.asymmetric_crypto_facade
++				.load_key_pair_and_decrypt_sym_key(
++					key_group,
++					convert_version_to_u64(bucket_key.recipientKeyVersion),
++					&protocol_version,
++					pub_enc_bucket_key,
++				)
++				.await
++				.map_err(|e| DecryptBucketError::Resolution(e.into()))?
++		} else if bucket_key.groupEncBucketKey.is_some() {
++			return Err(DecryptBucketError::GroupReferenceUnsupported);
++		} else {
++			return Err(DecryptBucketError::Resolution(SessionKeyResolutionError {
++				reason: "encrypted bucket key not set on bucket key".to_string(),
++			}));
++		};
++
++		let mut instance_keys = Vec::with_capacity(bucket_key.bucketEncSessionKeys.len());
++		for entry in &bucket_key.bucketEncSessionKeys {
++			let session_key = bucket_aes_key
++				.decrypt_aes_key(entry.symEncSessionKey.as_slice())
++				.map_err(|e| DecryptBucketError::Resolution(e.into()))?;
++			instance_keys.push(BucketInstanceKey {
++				instance_list: entry.instanceList.clone(),
++				instance_id: entry.instanceId.clone(),
++				session_key,
++			});
++		}
++		Ok(DecryptedBucket {
++			instance_keys,
+ 			sender_identity_pub_key,
+ 		})
+ 	}
++
++	/// The session keys a bucket names for children of the entity that
++	/// carries it, as TS `resolveWithBucketKey` feeds the attachments'
++	/// `OwnerEncSessionKeyProvider`: one decapsulation, one key per requested
++	/// id in the requested order, each matched on its full id and wrapped
++	/// with the current key of `owner_group`, the parent's owner group. The
++	/// children are not authenticated. Nothing is written or cached.
++	pub async fn resolve_bucket_instance_keys(
++		&self,
++		bucket_key: &BucketKey,
++		owner_group: &GeneratedId,
++		requested: &[IdTupleGenerated],
++	) -> Result<Vec<ResolvedSessionKey>, BucketKeyError> {
++		if requested.is_empty() {
++			return Ok(Vec::new());
++		}
++		let bucket = self.decrypt_bucket(bucket_key).await?;
++
++		let mut session_keys = Vec::with_capacity(requested.len());
++		for id in requested {
++			let mut matches = bucket
++				.instance_keys
++				.iter()
++				.filter(|key| key.instance_list == id.list_id && key.instance_id == id.element_id);
++			let Some(first) = matches.next() else {
++				return Err(BucketKeyError::NoEntry);
++			};
++			if matches.next().is_some() {
++				return Err(BucketKeyError::AmbiguousEntries);
++			}
++			session_keys.push(first.session_key.clone());
++		}
++
++		let owner_group_key = self
++			.key_loader_facade
++			.get_current_sym_group_key(owner_group)
++			.await
++			.map_err(|e| BucketKeyError::Resolution(e.into()))?;
++		Ok(session_keys
++			.into_iter()
++			.map(|session_key| {
++				let owner_enc_session_key = owner_group_key.object.encrypt_key(
++					&session_key,
++					InitializationVector::generate(&self.randomizer_facade),
++				);
++				ResolvedSessionKey {
++					session_key,
++					owner_enc_session_key,
++					owner_key_version: owner_group_key.version,
++					sender_identity_pub_key: None,
++				}
++			})
++			.collect())
++	}
++}
++
++/// Every session key a bucket carries, decrypted once.
++struct DecryptedBucket {
++	instance_keys: Vec<BucketInstanceKey>,
++	sender_identity_pub_key: Option<X25519PublicKey>,
++}
++
++/// One entry of a bucket: the instance it names and its decrypted key.
++struct BucketInstanceKey {
++	instance_list: GeneratedId,
++	instance_id: GeneratedId,
++	session_key: GenericAesKey,
++}
++
++enum DecryptBucketError {
++	GroupReferenceUnsupported,
++	Resolution(SessionKeyResolutionError),
++}
++
++impl DecryptBucketError {
++	fn into_resolution_error(self) -> SessionKeyResolutionError {
++		match self {
++			Self::GroupReferenceUnsupported => SessionKeyResolutionError {
++				reason: "groupEncBucketKey (secure external) is not supported".to_string(),
++			},
++			Self::Resolution(error) => error,
++		}
++	}
++}
++
++impl From<DecryptBucketError> for BucketKeyError {
++	fn from(error: DecryptBucketError) -> Self {
++		match error {
++			DecryptBucketError::GroupReferenceUnsupported => Self::GroupReferenceUnsupported,
++			DecryptBucketError::Resolution(error) => Self::Resolution(error),
++		}
++	}
+ }
+ 
+ /// Resolves the id field of an entity into a generated id
+@@ -479,6 +595,20 @@ impl SessionKeyResolutionErrorSubtype for TutaCryptError {}
+ impl SessionKeyResolutionErrorSubtype for RSAEncryptionError {}
+ impl SessionKeyResolutionErrorSubtype for AsymmetricCryptoError {}
+ 
++/// Why a bucket could not name a session key for a requested instance. The
++/// messages name the case, never an instance.
++#[derive(thiserror::Error, Debug)]
++pub enum BucketKeyError {
++	#[error("no bucket entry for a requested instance")]
++	NoEntry,
++	#[error("more than one bucket entry for a requested instance")]
++	AmbiguousEntries,
++	#[error("groupEncBucketKey (secure external) is not supported")]
++	GroupReferenceUnsupported,
++	#[error(transparent)]
++	Resolution(#[from] SessionKeyResolutionError),
++}
++
+ #[must_use]
+ pub fn create_auth_verifier(user_passphrase_key: Aes256Key) -> String {
+ 	let sha_user_passphrase = crypto_primitives::sha::sha256(user_passphrase_key.as_bytes());
+@@ -490,7 +620,7 @@ mod test {
+ 	use crate::bindings::file_client::MockFileClient;
+ 	use crate::bindings::rest_client::MockRestClient;
+ 	use crate::crypto::asymmetric_crypto_facade::{DecapsulatedAesKey, MockAsymmetricCryptoFacade};
+-	use crate::crypto::crypto_facade::CryptoFacade;
++	use crate::crypto::crypto_facade::{BucketKeyError, CryptoFacade};
+ 	use crate::crypto::x25519::X25519KeyPair;
+ 	use crate::element_value::ParsedEntity;
+ 	use crate::entities::generated::sys::{BucketKey, GroupInfo, InstanceSessionKey, Permission};
+@@ -928,4 +1058,314 @@ mod test {
+ 			..create_test_entity()
+ 		}
+ 	}
++
++	/// A bucket entry for `(list, element)` whose session key is `sk`.
++	fn bucket_entry(
++		list: &GeneratedId,
++		element: &GeneratedId,
++		bucket_key: &GenericAesKey,
++		sk: &GenericAesKey,
++	) -> InstanceSessionKey {
++		let randomizer = make_thread_rng_facade();
++		InstanceSessionKey {
++			encryptionAuthStatus: None,
++			instanceId: element.clone(),
++			instanceList: list.clone(),
++			symEncSessionKey: bucket_key
++				.encrypt_key(sk, InitializationVector::generate(&randomizer)),
++			symKeyVersion: 1,
++			..create_test_entity()
++		}
++	}
++
++	/// A TutaCrypt bucket naming the mail of `constants` plus every `(id, key)`
++	/// child, and a facade whose decapsulation returns the bucket key and
++	/// counts its calls.
++	fn bucket_with_children(
++		constants: &BucketKeyConstants,
++		children: &[(IdTupleGenerated, GenericAesKey)],
++	) -> (BucketKey, Arc<std::sync::atomic::AtomicUsize>, CryptoFacade) {
++		let randomizer = make_thread_rng_facade();
++		let mut bucket = make_bucket_key(
++			constants.recipient_key_version,
++			constants.pub_enc_bucket_key.clone(),
++			&constants.instance_id,
++			&constants.instance_list,
++			&constants.key_group,
++			constants.bucket_enc_session_key.clone(),
++			CryptoProtocolVersion::TutaCrypt as i64,
++		);
++		for (id, key) in children {
++			bucket.bucketEncSessionKeys.push(bucket_entry(
++				&id.list_id,
++				&id.element_id,
++				&constants.bucket_key_generic,
++				key,
++			));
++		}
++		let decapsulations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++		let counter = decapsulations.clone();
++		let bucket_key = constants.bucket_key_generic.clone();
++		let mut asymmetric_crypto_facade = MockAsymmetricCryptoFacade::default();
++		asymmetric_crypto_facade
++			.expect_load_key_pair_and_decrypt_sym_key()
++			.returning(move |_, _, _, _| {
++				counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++				Ok(DecapsulatedAesKey {
++					decrypted_aes_key: bucket_key.clone(),
++					sender_identity_pub_key: None,
++				})
++			});
++		let facade = make_crypto_facade(
++			randomizer,
++			constants.group_key.clone(),
++			constants.sender_key_version,
++			Some(asymmetric_crypto_facade),
++			vec![],
++			None,
++		);
++		(bucket, decapsulations, facade)
++	}
++
++	fn child(key: GenericAesKey) -> (IdTupleGenerated, GenericAesKey) {
++		(
++			IdTupleGenerated {
++				list_id: GeneratedId::test_random(),
++				element_id: GeneratedId::test_random(),
++			},
++			key,
++		)
++	}
++
++	#[tokio::test]
++	async fn bucket_instance_keys_come_from_one_decapsulation_wrapped_for_the_parent_group() {
++		let randomizer = make_thread_rng_facade();
++		let constants = BucketKeyConstants::new(&randomizer);
++		let first = child(GenericAesKey::from(Aes256Key::generate(&randomizer)));
++		let second = child(GenericAesKey::from(Aes256Key::generate(&randomizer)));
++		let (bucket, decapsulations, facade) =
++			bucket_with_children(&constants, &[first.clone(), second.clone()]);
++
++		let keys = facade
++			.resolve_bucket_instance_keys(
++				&bucket,
++				&constants.key_group,
++				&[second.0.clone(), first.0.clone()],
++			)
++			.await
++			.unwrap();
++
++		assert_eq!(decapsulations.load(std::sync::atomic::Ordering::SeqCst), 1);
++		assert_eq!(keys.len(), 2);
++		// Requested order, not bucket order.
++		assert_eq!(keys[0].session_key.as_bytes(), second.1.as_bytes());
++		assert_eq!(keys[1].session_key.as_bytes(), first.1.as_bytes());
++		for key in &keys {
++			assert_eq!(key.owner_key_version, constants.sender_key_version);
++			assert!(key.sender_identity_pub_key.is_none());
++			let unwrapped = constants
++				.group_key
++				.decrypt_aes_key(&key.owner_enc_session_key)
++				.unwrap();
++			assert_eq!(unwrapped.as_bytes(), key.session_key.as_bytes());
++		}
++		// The parent's own key is unchanged and is not a child's.
++		let parent = facade
++			.resolve_session_key(
++				&make_raw_mail(
++					&constants,
++					constants.pub_enc_bucket_key.clone(),
++					CryptoProtocolVersion::TutaCrypt as i64,
++				),
++				&get_mail_type_model(),
++			)
++			.await
++			.unwrap()
++			.unwrap();
++		assert_eq!(
++			parent.session_key.as_bytes(),
++			constants.mail_session_key.as_bytes()
++		);
++	}
++
++	#[tokio::test]
++	async fn bucket_instance_keys_match_the_full_id_not_the_element_alone() {
++		let randomizer = make_thread_rng_facade();
++		let constants = BucketKeyConstants::new(&randomizer);
++		let file = child(GenericAesKey::from(Aes256Key::generate(&randomizer)));
++		let (bucket, _, facade) = bucket_with_children(&constants, &[file.clone()]);
++
++		let other_list = IdTupleGenerated {
++			list_id: GeneratedId::test_random(),
++			element_id: file.0.element_id.clone(),
++		};
++		let error = facade
++			.resolve_bucket_instance_keys(&bucket, &constants.key_group, &[other_list])
++			.await
++			.unwrap_err();
++		assert!(matches!(error, BucketKeyError::NoEntry), "{error}");
++
++		let other_element = IdTupleGenerated {
++			list_id: file.0.list_id.clone(),
++			element_id: GeneratedId::test_random(),
++		};
++		let error = facade
++			.resolve_bucket_instance_keys(&bucket, &constants.key_group, &[other_element])
++			.await
++			.unwrap_err();
++		assert!(matches!(error, BucketKeyError::NoEntry), "{error}");
++	}
++
++	#[tokio::test]
++	async fn bucket_instance_keys_refuse_a_duplicated_entry_and_a_missing_one_entirely() {
++		let randomizer = make_thread_rng_facade();
++		let constants = BucketKeyConstants::new(&randomizer);
++		let file = child(GenericAesKey::from(Aes256Key::generate(&randomizer)));
++		let twin = (
++			file.0.clone(),
++			GenericAesKey::from(Aes256Key::generate(&randomizer)),
++		);
++		let (bucket, _, facade) = bucket_with_children(&constants, &[file.clone(), twin]);
++
++		let error = facade
++			.resolve_bucket_instance_keys(&bucket, &constants.key_group, &[file.0.clone()])
++			.await
++			.unwrap_err();
++		assert!(matches!(error, BucketKeyError::AmbiguousEntries), "{error}");
++
++		// One known id and one unknown: nothing is returned.
++		let (bucket, _, facade) = bucket_with_children(&constants, &[file.clone()]);
++		let unknown = child(GenericAesKey::from(Aes256Key::generate(&randomizer))).0;
++		let error = facade
++			.resolve_bucket_instance_keys(&bucket, &constants.key_group, &[file.0, unknown])
++			.await
++			.unwrap_err();
++		assert!(matches!(error, BucketKeyError::NoEntry), "{error}");
++	}
++
++	#[tokio::test]
++	async fn bucket_instance_keys_without_a_request_do_not_decapsulate() {
++		let randomizer = make_thread_rng_facade();
++		let constants = BucketKeyConstants::new(&randomizer);
++		let (bucket, decapsulations, facade) = bucket_with_children(&constants, &[]);
++
++		let keys = facade
++			.resolve_bucket_instance_keys(&bucket, &constants.key_group, &[])
++			.await
++			.unwrap();
++
++		assert!(keys.is_empty());
++		assert_eq!(decapsulations.load(std::sync::atomic::Ordering::SeqCst), 0);
++	}
++
++	fn group_reference_bucket(constants: &BucketKeyConstants) -> BucketKey {
++		let mut bucket = make_bucket_key(
++			constants.recipient_key_version,
++			constants.pub_enc_bucket_key.clone(),
++			&constants.instance_id,
++			&constants.instance_list,
++			&constants.key_group,
++			constants.bucket_enc_session_key.clone(),
++			CryptoProtocolVersion::Rsa as i64,
++		);
++		bucket.pubEncBucketKey = None;
++		bucket.groupEncBucketKey = Some(vec![1, 2, 3]);
++		bucket
++	}
++
++	#[tokio::test]
++	async fn a_group_reference_bucket_is_an_error_on_both_paths() {
++		let randomizer = make_thread_rng_facade();
++		let constants = BucketKeyConstants::new(&randomizer);
++		let bucket = group_reference_bucket(&constants);
++		let facade = make_crypto_facade(
++			randomizer,
++			constants.group_key.clone(),
++			constants.sender_key_version,
++			None,
++			vec![],
++			None,
++		);
++
++		let error = facade
++			.resolve_bucket_instance_keys(
++				&bucket,
++				&constants.key_group,
++				&[child(constants.mail_session_key.clone()).0],
++			)
++			.await
++			.unwrap_err();
++		assert!(
++			matches!(error, BucketKeyError::GroupReferenceUnsupported),
++			"{error}"
++		);
++
++		let mail = Mail {
++			_id: Some(IdTupleGenerated {
++				list_id: constants.instance_list.clone(),
++				element_id: constants.instance_id.clone(),
++			}),
++			_ownerGroup: Some(constants.key_group.clone()),
++			bucketKey: Some(bucket),
++			..create_test_entity()
++		};
++		let error = facade
++			.resolve_session_key(&typed_entity_to_parsed_entity(mail), &get_mail_type_model())
++			.await
++			.unwrap_err();
++		assert!(error.to_string().contains("groupEncBucketKey"), "{error}");
++	}
++
++	#[tokio::test]
++	async fn an_unknown_protocol_version_is_an_error_on_both_paths() {
++		let randomizer = make_thread_rng_facade();
++		let constants = BucketKeyConstants::new(&randomizer);
++		let mut bucket = make_bucket_key(
++			constants.recipient_key_version,
++			constants.pub_enc_bucket_key.clone(),
++			&constants.instance_id,
++			&constants.instance_list,
++			&constants.key_group,
++			constants.bucket_enc_session_key.clone(),
++			99,
++		);
++		bucket.groupEncBucketKey = None;
++		let facade = make_crypto_facade(
++			randomizer,
++			constants.group_key.clone(),
++			constants.sender_key_version,
++			None,
++			vec![],
++			None,
++		);
++
++		let error = facade
++			.resolve_bucket_instance_keys(
++				&bucket,
++				&constants.key_group,
++				&[child(constants.mail_session_key.clone()).0],
++			)
++			.await
++			.unwrap_err();
++		assert!(
++			matches!(error, BucketKeyError::Resolution(_))
++				&& error.to_string().contains("protocol version"),
++			"{error}"
++		);
++
++		let mail = Mail {
++			_id: Some(IdTupleGenerated {
++				list_id: constants.instance_list.clone(),
++				element_id: constants.instance_id.clone(),
++			}),
++			_ownerGroup: Some(constants.key_group.clone()),
++			bucketKey: Some(bucket),
++			..create_test_entity()
++		};
++		let error = facade
++			.resolve_session_key(&typed_entity_to_parsed_entity(mail), &get_mail_type_model())
++			.await
++			.unwrap_err();
++		assert!(error.to_string().contains("protocol version"), "{error}");
++	}
+ }
+diff --git a/tuta-sdk/rust/sdk/src/entities/entity_facade.rs b/tuta-sdk/rust/sdk/src/entities/entity_facade.rs
+index 9748cf3686..87bcbced58 100644
+--- a/tuta-sdk/rust/sdk/src/entities/entity_facade.rs
++++ b/tuta-sdk/rust/sdk/src/entities/entity_facade.rs
+@@ -1,7 +1,10 @@
+ mod decryption;
+ mod decryption_keys;
+ use decryption::InstanceDecryptor;
+-pub use decryption_keys::{has_kdf_nonce, EntityDecryptionKeys, EntityDecryptionRequirements};
++pub use decryption_keys::{
++	has_kdf_nonce, has_owner_enc_session_key, list_element_id, owner_group, EntityDecryptionKeys,
++	EntityDecryptionRequirements,
++};
+ 
+ use crate::crypto::crypto_facade::ResolvedSessionKey;
+ use crate::date::DateTime;
+diff --git a/tuta-sdk/rust/sdk/src/entities/entity_facade/decryption_keys.rs b/tuta-sdk/rust/sdk/src/entities/entity_facade/decryption_keys.rs
+index 82ae2680dc..bae33d6ed5 100644
+--- a/tuta-sdk/rust/sdk/src/entities/entity_facade/decryption_keys.rs
++++ b/tuta-sdk/rust/sdk/src/entities/entity_facade/decryption_keys.rs
+@@ -102,6 +102,47 @@ impl EntityDecryptionRequirements {
+ 	}
+ }
+ 
++/// The id of a parsed list element, when it has one.
++#[must_use]
++pub fn list_element_id(
++	model: &TypeModel,
++	entity: &ParsedEntity,
++) -> Option<crate::IdTupleGenerated> {
++	match model
++		.get_attribute_id_by_attribute_name(super::ID_FIELD)
++		.ok()
++		.and_then(|id| entity.get(&id))
++	{
++		Some(ElementValue::IdTupleGeneratedElementId(id)) => Some(id.clone()),
++		_ => None,
++	}
++}
++
++/// The owner group of a parsed entity, when set.
++#[must_use]
++pub fn owner_group(model: &TypeModel, entity: &ParsedEntity) -> Option<crate::GeneratedId> {
++	match model
++		.get_attribute_id_by_attribute_name(super::OWNER_GROUP_FIELD)
++		.ok()
++		.and_then(|id| entity.get(&id))
++	{
++		Some(ElementValue::IdGeneratedId(group)) => Some(group.clone()),
++		_ => None,
++	}
++}
++
++/// Whether a parsed entity carries an owner-encrypted session key of its own:
++/// any value but null counts, so that an unusable key is tried and refused by
++/// the session key resolution instead of being passed over.
++#[must_use]
++pub fn has_owner_enc_session_key(model: &TypeModel, entity: &ParsedEntity) -> bool {
++	model
++		.get_attribute_id_by_attribute_name(super::OWNER_ENC_SESSION_KEY_FIELD)
++		.ok()
++		.and_then(|id| entity.get(&id))
++		.is_some_and(|value| !matches!(value, ElementValue::Null))
++}
++
+ #[must_use]
+ pub fn has_kdf_nonce(model: &TypeModel, entity: &ParsedEntity) -> bool {
+ 	model
+@@ -237,4 +278,53 @@ mod tests {
+ 			.to_string()
+ 			.contains("writes are not supported"));
+ 	}
++
++	#[test]
++	fn the_parsed_field_accessors_read_ids_group_and_key_presence() {
++		use crate::entities::generated::tutanota::TutanotaFile;
++		use crate::util::test_utils::{create_test_entity, typed_entity_to_parsed_entity};
++		use crate::{GeneratedId, IdTupleGenerated};
++		let provider = TypeModelProvider::new_test(
++			std::sync::Arc::new(crate::bindings::rest_client::MockRestClient::default()),
++			std::sync::Arc::new(crate::bindings::file_client::MockFileClient::default()),
++			"http://localhost:9000".to_string(),
++		);
++		let model = provider
++			.resolve_server_type_ref(&TutanotaFile::type_ref())
++			.unwrap();
++		let id = IdTupleGenerated {
++			list_id: GeneratedId("list".to_owned()),
++			element_id: GeneratedId("element".to_owned()),
++		};
++		let group = GeneratedId("group".to_owned());
++		let mut file = TutanotaFile {
++			_id: Some(id.clone()),
++			_ownerGroup: Some(group.clone()),
++			_ownerEncSessionKey: None,
++			..create_test_entity()
++		};
++
++		let parsed = typed_entity_to_parsed_entity(file.clone());
++		assert_eq!(list_element_id(&model, &parsed), Some(id));
++		assert_eq!(owner_group(&model, &parsed), Some(group));
++		assert!(!has_owner_enc_session_key(&model, &parsed));
++
++		// An empty key is present: it is for the resolution to refuse it.
++		file._ownerEncSessionKey = Some(vec![]);
++		assert!(has_owner_enc_session_key(
++			&model,
++			&typed_entity_to_parsed_entity(file.clone())
++		));
++		file._ownerEncSessionKey = Some(vec![1, 2, 3]);
++		assert!(has_owner_enc_session_key(
++			&model,
++			&typed_entity_to_parsed_entity(file.clone())
++		));
++
++		file._id = None;
++		file._ownerGroup = None;
++		let parsed = typed_entity_to_parsed_entity(file);
++		assert_eq!(list_element_id(&model, &parsed), None);
++		assert_eq!(owner_group(&model, &parsed), None);
++	}
+ }
