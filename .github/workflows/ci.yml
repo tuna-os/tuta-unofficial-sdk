@@ -50,7 +50,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Format
-        run: cargo fmt -p tuta-unofficial-sdk -p tuta-helper --check
+        run: cargo fmt -p tuta-unofficial-sdk -p tuta-helper -p tuta-ffi -p tuta-ffi-bindgen --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
@@ -98,3 +98,85 @@ jobs:
         run: |
           scripts/cargo-sources.sh "$RUNNER_TEMP/cargo-sources.json"
           diff -u cargo-sources.json "$RUNNER_TEMP/cargo-sources.json"
+
+  android:
+    name: Android AAR, JVM tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Pinned with android/: compileSdk 37, the NDK the Tuna Mail fork uses,
+      # and the build tools AGP 9.5 asks for.
+      ANDROID_PACKAGES: platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+      CARGO_NDK_VERSION: 4.1.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Install the Android SDK packages and cargo-ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          IFS=' ' read -r -a packages <<<"$ANDROID_PACKAGES"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "${packages[@]}" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >>"$GITHUB_ENV"
+          cargo install --locked "cargo-ndk@$CARGO_NDK_VERSION"
+
+      - name: Prepare the Tuta SDK
+        run: |
+          git config --global --add safe.directory '*'
+          sh prepare.sh
+
+      - name: JVM tests (bindings against the host library)
+        working-directory: android
+        run: ./gradlew --no-daemon :tuta-sdk-jvm:test
+
+      - name: Build the AAR and the Maven repository
+        working-directory: android
+        run: ./gradlew --no-daemon :tuta-sdk-android:dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tuta-sdk-android
+          path: android/tuta-sdk-android/build/dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub release with the Android assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, deny, cargo-sources, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tuta-sdk-android
+          path: dist
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" \
+              --notes "See CHANGELOG.md. Android: org.tunaos.tuta:tuta-sdk-android (README, \"Android\")."
+          fi
+          gh release upload "$TAG" dist/* --clobber
