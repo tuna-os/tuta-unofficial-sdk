@@ -1,4 +1,4 @@
-//! The protocol: one request object per process, version 1, and the
+//! The protocol: one request object per reply, version 1, and the
 //! dispatch onto the library. Every check that needs no network runs before
 //! the session is resumed, in the order hylki-tuta made them.
 
@@ -16,7 +16,8 @@ use tuta_unofficial_sdk::{
     MAIL_BATCH_LIMIT, MAX_IMPORT_BYTES,
 };
 
-pub(crate) const VERSION: u32 = 1;
+/// The protocol version every request and reply carries.
+pub const VERSION: u32 = 1;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -258,31 +259,31 @@ pub(crate) struct Watch {
     pub(crate) session: SavedSession,
 }
 
-/// How this helper presents itself: the session name Tuta lists, and the
+/// How the helper presents itself: the session name Tuta lists, and the
 /// diagnostics switch and prefix.
-#[derive(Clone, Copy)]
-pub(crate) struct Identity {
-    pub(crate) client_name: &'static str,
-    pub(crate) debug_variable: &'static str,
-    pub(crate) prefix: &'static str,
+#[derive(Clone, Copy, Debug)]
+pub struct Identity {
+    pub client_name: &'static str,
+    pub debug_variable: &'static str,
+    pub prefix: &'static str,
 }
 
 impl Identity {
-    pub(crate) const HELPER: Identity = Identity {
+    pub const HELPER: Identity = Identity {
         client_name: "tuta-helper",
         debug_variable: "TUTA_HELPER_DEBUG",
         prefix: "tuta-helper",
     };
     /// Installed (or linked) as `hylki-tuta`, it is the helper Hylki has
     /// always run, and says so.
-    pub(crate) const HYLKI: Identity = Identity {
+    pub const HYLKI: Identity = Identity {
         client_name: "Hylki",
         debug_variable: "HYLKI_TUTA_DEBUG",
         prefix: "hylki-tuta",
     };
 
     /// By the name the program was started under (argv[0]).
-    pub(crate) fn from_program(argv0: Option<&std::ffi::OsStr>) -> Identity {
+    pub fn from_program(argv0: Option<&std::ffi::OsStr>) -> Identity {
         let name = argv0
             .and_then(|path| std::path::Path::new(path).file_name())
             .and_then(|name| name.to_str());
@@ -293,7 +294,7 @@ impl Identity {
         }
     }
 
-    pub(crate) fn client(&self) -> Result<Client> {
+    pub fn client(&self) -> Result<Client> {
         Ok(Client::new()?.client_name(self.client_name))
     }
 }
@@ -339,17 +340,16 @@ fn value(result: impl serde::Serialize) -> Value {
     serde_json::to_value(result).expect("protocol types serialize to JSON")
 }
 
-/// Every operation but `send` and `watch`, against `deadline`.
+/// Every operation but `watch`, against `deadline`.
 pub(crate) async fn dispatch(
-    identity: Identity,
+    client: &Client,
     operation: Operation,
     deadline: Instant,
 ) -> Result<Value> {
-    let client = identity.client()?;
     if let Operation::Send(send) = operation {
-        return send_mail(&client, *send, deadline).await;
+        return send_mail(client, *send, deadline).await;
     }
-    tokio::time::timeout_at(deadline, run(&client, operation))
+    tokio::time::timeout_at(deadline, run(client, operation))
         .await
         .unwrap_or(Err(Error::Timeout))
 }
@@ -600,7 +600,7 @@ fn import_request(r: &Import) -> Result<(Id, ImportMessage)> {
 }
 
 /// How long one operation may take.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[cfg(test)]
 mod tests {
@@ -889,6 +889,7 @@ mod tests {
     #[tokio::test]
     async fn offline_checks_never_connect() {
         let far = Instant::now() + REQUEST_TIMEOUT;
+        let client = Identity::HELPER.client().unwrap();
         let request = |body: &str| parse(body).unwrap().operation;
         let session = SESSION;
         for (body, code) in [
@@ -927,16 +928,14 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                dispatch(Identity::HELPER, request(&body), far).await.err(),
+                dispatch(&client, request(&body), far).await.err(),
                 Some(code),
                 "{body}"
             );
         }
         let empty = format!(r#"{{"version":1,"op":"contact_passwords",{session},"addresses":[]}}"#);
         assert_eq!(
-            dispatch(Identity::HELPER, request(&empty), far)
-                .await
-                .unwrap(),
+            dispatch(&client, request(&empty), far).await.unwrap(),
             json!({"recipients": []})
         );
     }
