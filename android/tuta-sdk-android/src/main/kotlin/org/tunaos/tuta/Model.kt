@@ -103,6 +103,22 @@ data class SyncPage(
     val offset: Long,
 )
 
+/** A [TutaClient.search] match: the mail as [TutaClient.sync] lists it, and the [folder] it was found in. */
+@Serializable(with = SearchHitSerializer::class)
+data class SearchHit(val mail: ListedMail, val folder: String)
+
+/**
+ * One [TutaClient.search] call: its [messages], how many mails it examined
+ * ([scanned]), and the cursor to go on from ([nextCursor], null once the
+ * search is complete). A page may hold no match and still have a cursor.
+ */
+@Serializable
+data class SearchPage(
+    val messages: List<SearchHit>,
+    @SerialName("next_cursor") val nextCursor: String? = null,
+    val scanned: Long,
+)
+
 /** A decrypted attachment. */
 @Serializable
 data class Attachment(
@@ -163,6 +179,29 @@ data class MoveOutcome(
 }
 
 internal const val NOT_ATTEMPTED = "not_attempted"
+
+/** A search hit is a listed mail's fields plus `folder`, flattened. */
+internal object SearchHitSerializer : KSerializer<SearchHit> {
+    override val descriptor: SerialDescriptor = JsonObject.serializer().descriptor
+
+    override fun deserialize(decoder: Decoder): SearchHit {
+        val json = (decoder as JsonDecoder).json
+        val fields = decoder.decodeJsonElement() as JsonObject
+        val folder = fields["folder"]?.jsonPrimitive?.content ?: throw IllegalArgumentException("no folder")
+        return SearchHit(json.decodeFromJsonElement(ListedMailSerializer, fields), folder)
+    }
+
+    override fun serialize(encoder: Encoder, value: SearchHit) {
+        val json = (encoder as JsonEncoder).json
+        val mail = json.encodeToJsonElement(ListedMailSerializer, value.mail) as JsonObject
+        encoder.encodeJsonElement(
+            buildJsonObject {
+                mail.forEach { (key, element) -> put(key, element) }
+                put("folder", JsonPrimitive(value.folder))
+            },
+        )
+    }
+}
 
 /** What [TutaClient.deleteFolder] did. */
 @Serializable

@@ -11,6 +11,7 @@ use tokio::time::Instant;
 use tuta_unofficial_sdk::{
     contacts::{self, Passwords},
     drafts::{self, DraftRequest},
+    search::{Search, SearchCursor, SearchQuery},
     Action, Client, Color, Error, FolderEdit, Id, ImportMessage, LabelChanges, LabelEdit, Name,
     OutgoingAttachment, Page, PendingSession, Recipient, Result, SavedSession, SendRequest,
     Session, Thread, MAIL_BATCH_LIMIT, MAX_IMPORT_BYTES,
@@ -30,6 +31,10 @@ pub(crate) enum Operation {
         /// handed back: the code completes it instead of a new sign-in.
         pending_session: Option<PendingSession>,
     },
+    /// Give up a sign-in waiting for its second factor.
+    CancelSignIn {
+        pending_session: PendingSession,
+    },
     Sync {
         session: SavedSession,
         folder: Option<String>,
@@ -40,6 +45,12 @@ pub(crate) enum Operation {
         session: SavedSession,
         id: String,
     },
+    /// A mail rebuilt as RFC 5322 MIME.
+    GetMime {
+        session: SavedSession,
+        id: String,
+    },
+    Search(Box<SearchMail>),
     MarkRead {
         session: SavedSession,
         ids: Vec<String>,
@@ -120,6 +131,24 @@ pub(crate) struct SendMail {
     /// Whitespace-separated Message-IDs, oldest first.
     references: Option<String>,
     action: Option<Action>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchMail {
+    session: SavedSession,
+    /// A folder or label; every folder when absent.
+    folder: Option<String>,
+    keyword: Option<String>,
+    subject: Option<String>,
+    sender: Option<String>,
+    recipient: Option<String>,
+    after_ms: Option<u64>,
+    before_ms: Option<u64>,
+    is_unread: Option<bool>,
+    limit: usize,
+    /// The `next_cursor` of the previous page.
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -462,6 +491,10 @@ async fn resume(client: &Client, saved: SavedSession) -> Result<Session> {
 async fn run(client: &Client, operation: Operation) -> Result<Value> {
     match operation {
         Operation::Login { .. } => unreachable!("dispatch handles login"),
+        Operation::CancelSignIn { pending_session } => {
+            client.cancel_sign_in(pending_session).await?;
+            Ok(json!({}))
+        }
         Operation::Sync {
             session,
             folder,
@@ -482,6 +515,22 @@ async fn run(client: &Client, operation: Operation) -> Result<Value> {
             let session = resume(client, session).await?;
             let id = Id::parse(&id)?;
             Ok(value(session.message(&id).await?))
+        }
+        Operation::GetMime { session, id } => {
+            let id = Id::parse(&id)?;
+            let session = resume(client, session).await?;
+            let mime = session.message(&id).await?.to_mime();
+            Ok(json!({"mime_base64": STANDARD.encode(mime)}))
+        }
+        Operation::Search(r) => {
+            let r = *r;
+            let (folder, search, cursor) = search_request(&r)?;
+            let session = resume(client, r.session).await?;
+            Ok(value(
+                session
+                    .search(folder.as_ref(), &search, cursor.as_ref())
+                    .await?,
+            ))
         }
         Operation::MarkRead {
             session,
@@ -644,6 +693,36 @@ fn draft_request(r: SaveDraft) -> Result<(SavedSession, DraftRequest)> {
     Ok((r.session, request))
 }
 
+/// A `search` request's folder, criteria and cursor, checked before any
+/// I/O: a folder that is not an id names no folder (as in `sync`), and a
+/// cursor must be one this search handed out.
+fn search_request(r: &SearchMail) -> Result<(Option<Id>, Search, Option<SearchCursor>)> {
+    let search = Search::new(
+        SearchQuery {
+            keyword: r.keyword.clone(),
+            subject: r.subject.clone(),
+            sender: r.sender.clone(),
+            recipient: r.recipient.clone(),
+            after_ms: r.after_ms,
+            before_ms: r.before_ms,
+            is_unread: r.is_unread,
+        },
+        r.limit,
+    )?;
+    let folder = r
+        .folder
+        .as_deref()
+        .map(|folder| Id::parse(folder).map_err(|_| Error::FolderNotFound))
+        .transpose()?;
+    let cursor = r.cursor.as_deref().map(SearchCursor::parse).transpose()?;
+    if let (Some(folder), Some(cursor)) = (&folder, &cursor) {
+        if cursor.folder() != folder {
+            return Err(Error::InvalidRequest);
+        }
+    }
+    Ok((folder, search, cursor))
+}
+
 /// An `import` request's folder and message, checked before any I/O. An
 /// oversized message is refused before decoding, so it costs no copy.
 fn import_request(r: &Import) -> Result<(Id, ImportMessage)> {
@@ -766,6 +845,11 @@ mod tests {
             json!({"op": "sync", "limit": 10, "offset": 0}),
             json!({"op": "sync", "folder": "a/b", "limit": 10, "offset": 0}),
             json!({"op": "message", "id": "a/b"}),
+            json!({"op": "get_mime", "id": "a/b"}),
+            json!({"op": "search", "keyword": "x", "limit": 10}),
+            json!({"op": "search", "folder": "a/b", "keyword": "k", "subject": "s",
+                   "sender": "f", "recipient": "t", "after_ms": 1, "before_ms": 2,
+                   "is_unread": true, "limit": 10, "cursor": "a/b/c"}),
             json!({"op": "mark_read", "ids": ["a/b"], "is_read": true}),
             json!({"op": "move", "ids": ["a/b"], "destination": "f/f"}),
             json!({"op": "revoke"}),
@@ -805,6 +889,18 @@ mod tests {
         ));
         assert!(parses(
             &json!({"version": 1, "op": "login", "email": "a@b", "password": "p"})
+        ));
+        // Tuta has no starred mail to search for.
+        assert!(!parses(
+            &json!({"version": 1, "op": "search", "session": session, "is_starred": true, "limit": 1})
+        ));
+        let pending: Value = serde_json::from_str(PENDING).unwrap();
+        assert!(parses(
+            &json!({"version": 1, "op": "cancel_sign_in", "pending_session": pending})
+        ));
+        assert!(!parses(&json!({"version": 1, "op": "cancel_sign_in"})));
+        assert!(!parses(
+            &json!({"version": 1, "op": "cancel_sign_in", "pending_session": pending, "email": "a@b"})
         ));
     }
 
@@ -983,6 +1079,54 @@ mod tests {
             (
                 format!(r#"{{"version":1,"op":"contact_passwords",{session},"addresses":["x"]}}"#),
                 Error::InvalidRecipient,
+            ),
+            (
+                format!(r#"{{"version":1,"op":"get_mime",{session},"id":"nope"}}"#),
+                Error::InvalidId,
+            ),
+            (
+                format!(r#"{{"version":1,"op":"search",{session},"keyword":"x","limit":0}}"#),
+                Error::InvalidPage,
+            ),
+            (
+                format!(r#"{{"version":1,"op":"search",{session},"limit":10}}"#),
+                Error::InvalidRequest,
+            ),
+            (
+                format!(r#"{{"version":1,"op":"search",{session},"subject":" ","limit":10}}"#),
+                Error::InvalidRequest,
+            ),
+            (
+                format!(
+                    r#"{{"version":1,"op":"search",{session},"after_ms":5,"before_ms":5,"limit":10}}"#
+                ),
+                Error::InvalidRequest,
+            ),
+            (
+                format!(
+                    r#"{{"version":1,"op":"search",{session},"folder":"nope","keyword":"x","limit":10}}"#
+                ),
+                Error::FolderNotFound,
+            ),
+            (
+                format!(
+                    r#"{{"version":1,"op":"search",{session},"keyword":"x","limit":10,"cursor":"junk"}}"#
+                ),
+                Error::InvalidRequest,
+            ),
+            (
+                format!(
+                    r#"{{"version":1,"op":"search",{session},"folder":"a/b","keyword":"x",
+                    "limit":10,"cursor":"c/d/e"}}"#
+                ),
+                Error::InvalidRequest,
+            ),
+            (
+                // A pending session whose token holds no session id.
+                r#"{"version":1,"op":"cancel_sign_in","pending_session":{"login":"a@tuta.com",
+                "user_id":"u","access_token":"t","encrypted_passphrase_key":[]}}"#
+                    .to_string(),
+                Error::SessionInvalid,
             ),
         ] {
             assert_eq!(

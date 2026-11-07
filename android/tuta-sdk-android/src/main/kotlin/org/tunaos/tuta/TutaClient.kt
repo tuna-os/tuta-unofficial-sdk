@@ -91,6 +91,47 @@ class TutaClient private constructor(private val native: TutaFfi) : AutoCloseabl
     suspend fun message(session: TutaSession, id: String): Message =
         decode(Message.serializer()) { call("message", session) { put("id", id) } }
 
+    /**
+     * A mail as RFC 5322 MIME, an `.eml` file: rebuilt from Tuta's decrypted
+     * parts (README, "Raw MIME"), since Tuta does not keep the message as it
+     * arrived.
+     */
+    suspend fun getMime(session: TutaSession, id: String): ByteArray {
+        val encoded = call("get_mime", session) { put("id", id) }["mime_base64"]
+        val text = (encoded as? JsonPrimitive)?.takeIf { it.isString }?.content
+            ?: throw TutaException.of(TutaErrorCode.INCOMPLETE_RESPONSE.wire)
+        return withContext(Dispatchers.Default) {
+            try {
+                Base64.decode(text)
+            } catch (_: IllegalArgumentException) {
+                throw TutaException.of(TutaErrorCode.INCOMPLETE_RESPONSE.wire)
+            }
+        }
+    }
+
+    /**
+     * Search [folder] (a folder or a label; every folder when null) for
+     * [query], at most [limit] (1 to 100) matches per call. Tuta has no
+     * server-side search, so this is a bounded scan (README, "Search"): a
+     * call examines at most 500 mails and 50 bodies, and hands back
+     * [SearchPage.nextCursor] to pass as [cursor] for the next call, with
+     * the same [folder] and [query], until it is null.
+     */
+    suspend fun search(
+        session: TutaSession,
+        query: SearchQuery,
+        folder: String? = null,
+        limit: Int = 50,
+        cursor: String? = null,
+    ): SearchPage = decode(SearchPage.serializer()) {
+        call("search", session) {
+            folder?.let { put("folder", it) }
+            with(query) { fields() }
+            put("limit", limit)
+            cursor?.let { put("cursor", it) }
+        }
+    }
+
     /** Mark up to 50 mails read or unread. */
     suspend fun markRead(session: TutaSession, ids: List<String>, isRead: Boolean): List<IdOutcome> =
         outcomes(IdOutcome.serializer()) {
@@ -119,6 +160,16 @@ class TutaClient private constructor(private val native: TutaFfi) : AutoCloseabl
     /** Close [session] on the server. */
     suspend fun revoke(session: TutaSession) {
         call("revoke", session) {}
+    }
+
+    /**
+     * Give up a sign-in waiting for its second factor ([pending], from
+     * [TutaException.pendingSession]): Tuta closes the session it opened
+     * for it instead of leaving it to expire. Call it when the user cancels
+     * the code prompt; a session already gone counts as closed.
+     */
+    suspend fun cancelSignIn(pending: TutaPendingSession) {
+        call("cancel_sign_in") { put("pending_session", pending.element) }
     }
 
     /** The account's labels. */

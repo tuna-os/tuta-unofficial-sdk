@@ -102,6 +102,20 @@ class NativeContractTest {
         fails<TutaException.Send>(TutaErrorCode.INVALID_RECIPIENT) {
             client.contactPasswords(session, listOf("not an address"))
         }
+        fails<TutaException.InvalidRequest>(TutaErrorCode.INVALID_ID) { client.getMime(session, "nope") }
+        fails<TutaException.InvalidRequest>(TutaErrorCode.INVALID_PAGE) {
+            client.search(session, SearchQuery(keyword = "x"), limit = 0)
+        }
+        fails<TutaException.InvalidRequest>(TutaErrorCode.INVALID_REQUEST) { client.search(session, SearchQuery()) }
+        fails<TutaException.InvalidRequest>(TutaErrorCode.INVALID_REQUEST) {
+            client.search(session, SearchQuery(afterMs = 5, beforeMs = 5))
+        }
+        fails<TutaException.InvalidRequest>(TutaErrorCode.INVALID_REQUEST) {
+            client.search(session, SearchQuery(subject = "x"), folder = "a/b", cursor = "c/d/e")
+        }
+        fails<TutaException.Folders>(TutaErrorCode.FOLDER_NOT_FOUND) {
+            client.search(session, SearchQuery(isUnread = true), folder = "nope")
+        }
     }
 
     @Test
@@ -168,6 +182,20 @@ class NativeContractTest {
     }
 
     @Test
+    fun aPendingSignInCanBeCancelled() {
+        // A token that holds no session id: refused before any I/O.
+        val malformed = TutaPendingSession(
+            Json.parseToJsonElement(
+                """{"login":"a@tuta.com","user_id":"u","access_token":"t","encrypted_passphrase_key":[]}""",
+            ).jsonObject,
+        )
+        fails<TutaException.Session>(TutaErrorCode.SESSION_INVALID) { client.cancelSignIn(malformed) }
+        // A real one goes to the server, which is not there.
+        val pending = TutaPendingSession(Json.parseToJsonElement(session.json).jsonObject)
+        fails<TutaException.Transport>(TutaErrorCode.TRANSPORT_FAILED) { client.cancelSignIn(pending) }
+    }
+
+    @Test
     fun anUnreachableServerIsATransportFailure() {
         fails<TutaException.Transport>(TutaErrorCode.TRANSPORT_FAILED) { client.login("a@tuta.com", "password") }
         fails<TutaException.Transport>(TutaErrorCode.TRANSPORT_FAILED) { client.sync(session, limit = 10) }
@@ -227,5 +255,21 @@ class NativeContractTest {
         assertTrue(!outcome.isApplied && !outcome.isAttempted && outcome.error == null)
         val failed = TutaJson.decodeFromString(IdOutcome.serializer(), """{"id":"m/1","code":"transport_failed"}""")
         assertIs<TutaException.Transport>(failed.error)
+        val search = TutaJson.decodeFromString(
+            SearchPage.serializer(),
+            """
+            {"messages":[{"id":"m/1","subject":"s","date_ms":5,"sender":{"name":"A","address":"a@x"},
+                          "recipient":null,"is_unread":false,"confidential":true,"conversation":"c",
+                          "message_id":"x@y","has_attachments":true,"reply_type":1,"labels":[],
+                          "folder":"f/1","new_field":2}],
+             "next_cursor":"f/1/AAAA","scanned":3}
+            """,
+        )
+        assertEquals("f/1", search.messages.single().folder)
+        assertEquals("m/1", search.messages.single().mail.header.id)
+        assertEquals("f/1/AAAA", search.nextCursor)
+        assertEquals(3L, search.scanned)
+        val done = TutaJson.decodeFromString(SearchPage.serializer(), """{"messages":[],"next_cursor":null,"scanned":0}""")
+        assertNull(done.nextCursor)
     }
 }

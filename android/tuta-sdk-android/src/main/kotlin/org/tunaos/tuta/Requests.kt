@@ -96,6 +96,36 @@ class DraftRequest(
     }
 }
 
+/**
+ * What [TutaClient.search] looks for (README, "Search"). Every criterion
+ * given must hold, and at least one must be given. Text criteria are
+ * case-insensitive substrings of at most 256 characters: [keyword] looks in
+ * the subject, the sender, the recipients and the body text, [recipient] in
+ * To, Cc and Bcc. [afterMs] (inclusive) and [beforeMs] (exclusive) bound the
+ * received date, in milliseconds since the epoch.
+ */
+data class SearchQuery(
+    val keyword: String? = null,
+    val subject: String? = null,
+    val sender: String? = null,
+    val recipient: String? = null,
+    val afterMs: Long? = null,
+    val beforeMs: Long? = null,
+    val isUnread: Boolean? = null,
+) {
+    override fun toString(): String = "SearchQuery(<redacted>)"
+
+    internal fun JsonObjectBuilder.fields() {
+        keyword?.let { put("keyword", it) }
+        subject?.let { put("subject", it) }
+        sender?.let { put("sender", it) }
+        recipient?.let { put("recipient", it) }
+        afterMs?.let { put("after_ms", it) }
+        beforeMs?.let { put("before_ms", it) }
+        isUnread?.let { put("is_unread", it) }
+    }
+}
+
 private fun JsonObjectBuilder.mail(
     sender: String,
     senderName: String,
