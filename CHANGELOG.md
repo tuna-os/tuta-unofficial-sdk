@@ -4,6 +4,31 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (0.x: the API may still change).
 
+## [0.2.0] - 2026-11-07
+
+### Added
+
+- `tuta-sdk-android` (`org.tunaos.tuta:tuta-sdk-android`), the helper
+  protocol in process for Android and the JVM: `crates/tuta-ffi` exposes it
+  through uniffi as `libtuta_ffi` (`request`, `watch` with a listener and a
+  stop handle, the error code list), and a Kotlin layer types it
+  (`TutaClient`, `TutaSession`, data classes, `TutaException` by family with
+  `TutaErrorCode`, `watch` as a `Flow`). The AAR carries arm64-v8a and
+  x86_64 libraries built with cargo-ndk, minSdk 24; releases attach it and a
+  zipped Maven repository.
+- JVM tests of the Kotlin layer against a host-built library, and an
+  ignored live test through it.
+- `crates/tuta-ffi-bindgen`, `uniffi-bindgen` at the uniffi revision the
+  SDK links.
+- CI builds the AAR, runs the JVM tests, and attaches the Android assets to
+  the release of a tag.
+- `05-quiet-type-model-fetch.patch`: the SDK no longer prints to stdout.
+
+### Changed
+
+- `tuta-helper` is also a library: the protocol (`respond`, `watch::serve`)
+  is shared by the binary and `tuta-ffi`, with no change on the wire.
+
 ## [0.1.0] - 2026-11-05
 
 The first release, extracted from the `hylki-tuta` helper of the Hylki mail
