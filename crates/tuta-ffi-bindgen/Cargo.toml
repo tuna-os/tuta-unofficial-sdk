@@ -1,0 +1,19 @@
+[package]
+name = "tuta-ffi-bindgen"
+description = "uniffi-bindgen at the uniffi revision tuta-ffi links, for its Kotlin bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A package of its own rather than a binary of tuta-ffi: enabling uniffi's
+# `cli` feature there would rebuild the whole SDK each time a build switched
+# between the library and the generator.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { git = "https://github.com/mozilla/uniffi-rs.git", rev = "13a1c559cb3708eeca40dcf95dc8b3ccccf3b88c", default-features = false, features = ["cli"] }

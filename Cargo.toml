@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tuta-unofficial-sdk", "crates/tuta-helper"]
+members = ["crates/tuta-unofficial-sdk", "crates/tuta-helper", "crates/tuta-ffi", "crates/tuta-ffi-bindgen"]
 # prepared/ is written by prepare.sh (the pinned Tuta SDK with sdk-patches/
 # applied, beside tutabridge's crate); upstream/ is the tutabridge
 # submodule. Neither is part of this workspace.
@@ -7,8 +7,13 @@ exclude = ["upstream", "prepared"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.84"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tuna-os/tuta-unofficial-sdk"
+
+# The Android libraries (android/ builds them with it): release, stripped.
+[profile.android]
+inherits = "release"
+strip = true
