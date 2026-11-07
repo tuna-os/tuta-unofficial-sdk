@@ -218,7 +218,7 @@ async fn mail_sets(
 /// The code a bus that gave up reports.
 fn bus_error(error: &EventBusError) -> Error {
     match error {
-        EventBusError::AuthenticationRejected(429) => Error::TransportFailed,
+        EventBusError::AuthenticationRejected(429) => Error::RateLimited,
         EventBusError::AuthenticationRejected(_) => Error::SessionRevoked,
         EventBusError::InvalidMessage(_) => Error::WatchFailed,
         EventBusError::Stopped => Error::WatchFailed,
@@ -445,9 +445,10 @@ mod tests {
         );
         assert_eq!(
             bus_error(&EventBusError::AuthenticationRejected(429)),
-            Error::TransportFailed
+            Error::RateLimited
         );
         assert!(fatal(Error::SessionRevoked) && !fatal(Error::TransportFailed));
+        assert!(!fatal(Error::RateLimited));
     }
 
     #[test]

@@ -172,7 +172,7 @@ The API, all `async` on a tokio runtime:
 
 | Area | API |
 | --- | --- |
-| Sessions | `Client::new`, `Client::with_url`, `Client::client_name`, `Client::login(email, &SecretString, totp) -> Session`, `Session::resume(&client, SavedSession)`, `Session::saved`, `Session::revoke`, `Client::revoke(&SavedSession)` |
+| Sessions | `Client::new`, `Client::with_url`, `Client::client_name`, `Client::login(email, &SecretString, totp) -> Session`, `Client::sign_in` and `Client::complete_sign_in(PendingSession, totp)` (failing with a `SignInError` that may carry the `PendingSession`), `Session::resume(&client, SavedSession)`, `Session::saved`, `Session::revoke`, `Client::revoke(&SavedSession)` |
 | Reading | `Session::folders`, `labels`, `sync(Option<&Id>, Page) -> SyncPage`, `message(&Id) -> Message`, `Message::to_mime() -> Vec<u8>` |
 | Mail | `mark_read(&[Id], bool)`, `move_mail(&[Id], &Id)`, `delete(&[Id], &Id)`, `empty_folder(&Id)`, `apply_labels(&[Id], &LabelChanges)`; per-id `IdOutcome`/`MoveOutcome` rows |
 | Folders, labels | `create_folder(&Name, Option<&Id>)`, `rename_folder(&FolderEdit)`, `delete_folder(&Id) -> FolderDeletion`, `create_label(&Name, &Color)`, `update_label(&Id, &LabelEdit)`, `delete_label(&Id)` |
@@ -212,7 +212,7 @@ it is not on crates.io. Three ways in:
 
   ```toml
   [dependencies]
-  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.2.0-vendored" }
+  tuta-unofficial-sdk = { git = "https://github.com/tuna-os/tuta-unofficial-sdk", tag = "v0.2.1-vendored" }
   ```
 
   `scripts/vendor.sh` makes such a tag from a release tag. The plain tags
@@ -261,7 +261,7 @@ Every request carries `version: 1` and an `op`:
 
 | Operation | Parameters | Result |
 | --- | --- | --- |
-| `login` | `email`, `password`, optional `totp` | Resumable `session` |
+| `login` | `email`, `password`, optional `totp`, optional `pending_session` (see [Two-factor sign-in](#two-factor-sign-in)) | Resumable `session` |
 | `sync` | `session`, optional `folder`, `limit`, `offset` | Folder tree, labels, headers (each with its label ids and `message_id`), and the selected folder's full id snapshot when `offset` is zero |
 | `message` | `session`, compound `id` | Decrypted body, original headers, recipients and attachments; its header carries `message_id` too |
 | `mark_read` | `session`, `ids`, `is_read` | Per-id outcomes |
@@ -286,8 +286,36 @@ Every request carries `version: 1` and an `op`:
 | `watch` | `session` | A stream of event lines until stdin closes |
 
 A reply is either `{"version":1,"result":{...}}` or
-`{"version":1,"error":{"code":"..."}}`. Unknown operations, unknown fields and
-other versions are rejected.
+`{"version":1,"error":{"code":"..."}}`; a sign-in waiting on its second
+factor adds `pending_session` to the error. Unknown operations, unknown
+fields and other versions are rejected.
+
+### Two-factor sign-in
+
+A `login` for an account with a second factor makes Tuta open a session
+that waits for the code. Signing in again would open another one, and Tuta
+throttles sign-ins (`rate_limited`), so the waiting session is handed back:
+
+1. `login` without `totp` answers
+   `{"error":{"code":"second_factor_required","pending_session":{...}}}`.
+   `pending_session` is shaped like a `session` object and is a credential:
+   keep it in memory only, never on disk or in a log, and drop it when the
+   address or password changes.
+2. `login` again with the same `email` and `password`, the `totp` and that
+   `pending_session`: the code goes to the waiting session, no new one is
+   opened, and the reply is the resumable `session`. A `pending_session`
+   for another address is `invalid_request`.
+3. A malformed code (`invalid_totp`), a refused one
+   (`second_factor_failed`), an outage (`transport_failed`, `timeout`) or
+   throttling (`rate_limited`) answers with the `pending_session` again:
+   retry with it. `pending_session_expired` (the server let the session go)
+   and too many wrong codes (`rate_limited` without `pending_session`) mean
+   starting over with step 1.
+
+The second form checks first whether the session still waits for its code,
+so a retry after a code that went through but a sign-in that did not finish
+completes it without the code being sent twice. An abandoned pending
+session cannot be cancelled through this SDK; it expires on the server.
 
 Per-id outcomes are `{"outcomes":[{"id","code"}]}` in request order, at most
 50 ids: `code` is null when applied, the failure's code for the batch that
@@ -302,9 +330,12 @@ did not move (it was already in the destination).
 An error carries a fixed code, never SDK or server text:
 
 - Sign-in: `login_failed`, `second_factor_required`, `second_factor_failed`,
-  `invalid_totp`, `resume_failed`, `session_invalid`, `session_revoked`,
-  `client_outdated`.
-- Transport: `transport_failed`, `request_failed`, `timeout`.
+  `invalid_totp`, `unsupported_u2f`, `unsupported_webauthn`,
+  `unsupported_second_factor`, `resume_failed`, `session_invalid`,
+  `session_revoked`, `client_outdated`, `pending_session_expired`.
+- Transport: `transport_failed`, `request_failed`, `timeout`, `rate_limited`
+  (Tuta is throttling this account or client, HTTP 429, or too many wrong
+  second-factor codes: wait a few minutes; any operation can answer it).
 - Content: `decryption_failed`, `unsupported_legacy_body`,
   `attachment_failed`, `body_too_large`.
 - Requests: `invalid_request`, `unsupported_version`, `invalid_id`,
@@ -422,7 +453,7 @@ operation timeout applies. Every line carries `version: 1`:
 - `{"event":"reconnect"}` after the bus dropped and came back. The server
   replays what was missed, but a caller should resync all the same.
 - `{"error":{"code":...}}` when the watch cannot go on (`session_revoked`,
-  `client_outdated`, `transport_failed`, `watch_failed`); the helper exits
+  `client_outdated`, `transport_failed`, `rate_limited`, `watch_failed`); the helper exits
   after it. While the bus reconnects, the session is checked over REST, so
   an expired session ends the watch instead of retrying forever.
 
@@ -601,7 +632,7 @@ ways:
   }
   // the module's build.gradle.kts
   dependencies {
-      implementation("org.tunaos.tuta:tuta-sdk-android:0.2.0")
+      implementation("org.tunaos.tuta:tuta-sdk-android:0.2.1")
   }
   ```
 
@@ -625,7 +656,7 @@ tuta.watch(session).collect { event -> /* Ready, MailChanged(folder), ... */ }
 | Kotlin | Protocol |
 | --- | --- |
 | `TutaClient(clientName)`, `close()` | one native client; calls may overlap |
-| `login`, `revoke`, `TutaSession.fromJson`/`.json` | `login`, `revoke`, the `session` object |
+| `login(email, password, totp, pending)`, `revoke`, `TutaSession.fromJson`/`.json` | `login` (`TutaException.pendingSession` is the `pending_session`), `revoke`, the `session` object |
 | `sync`, `message`, `listLabels` | `sync`, `message`, `list_labels` |
 | `markRead`, `move`, `applyLabels`, `delete`, `emptyFolder` | the same, per-id `IdOutcome`/`MoveOutcome` |
 | `createFolder`, `renameFolder`, `deleteFolder`, `createLabel`, `updateLabel`, `deleteLabel` | the same |

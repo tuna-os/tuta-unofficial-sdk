@@ -88,11 +88,28 @@ fn an_unreachable_server_is_a_transport_failure() {
 }
 
 #[test]
+fn a_pending_sign_in_keeps_its_session_through_an_outage() {
+    let client = client(&closed_url());
+    let request = format!(
+        r#"{{"version":1,"op":"login","email":"a@tuta.com","password":"p",
+        "totp":"123456","pending_session":{SESSION}}}"#
+    );
+    let reply: Value = serde_json::from_str(&block_on(client.request(request))).unwrap();
+    assert_eq!(reply["error"]["code"], "transport_failed", "{reply}");
+    assert_eq!(
+        reply["error"]["pending_session"],
+        serde_json::from_str::<Value>(SESSION).unwrap()
+    );
+}
+
+#[test]
 fn every_code_and_the_version_are_exported() {
     let codes = error_codes();
     assert_eq!(codes.len(), Error::ALL.len());
     assert_eq!(codes.first().map(String::as_str), Some("login_failed"));
     assert!(codes.iter().any(|c| c == "send_uncertain"));
+    assert!(codes.iter().any(|c| c == "rate_limited"));
+    assert!(codes.iter().any(|c| c == "pending_session_expired"));
     assert!(codes.iter().all(|c| Error::from_code(c).is_some()));
     assert_eq!(protocol_version(), 1);
 }

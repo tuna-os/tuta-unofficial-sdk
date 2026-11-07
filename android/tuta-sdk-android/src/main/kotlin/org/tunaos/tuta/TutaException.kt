@@ -20,10 +20,16 @@ enum class TutaErrorCode(val wire: String, internal val category: Category) {
     SESSION_REVOKED("session_revoked", Category.SESSION),
     CLIENT_OUTDATED("client_outdated", Category.SESSION),
 
+    /** A sign-in's pending session is gone on the server: sign in again. */
+    PENDING_SESSION_EXPIRED("pending_session_expired", Category.SESSION),
+
     // Transport.
     TRANSPORT_FAILED("transport_failed", Category.TRANSPORT),
     REQUEST_FAILED("request_failed", Category.TRANSPORT),
     TIMEOUT("timeout", Category.TRANSPORT),
+
+    /** Tuta is throttling sign-ins or requests: wait a few minutes, then retry. */
+    RATE_LIMITED("rate_limited", Category.TRANSPORT),
 
     // Content.
     DECRYPTION_FAILED("decryption_failed", Category.CONTENT),
@@ -113,6 +119,15 @@ sealed class TutaException(
     /** The code as the wire carried it (for [Unknown], the unknown code). */
     val wireCode: String,
 ) : Exception(wireCode) {
+    /**
+     * For a sign-in that is waiting on its second factor
+     * ([TutaErrorCode.SECOND_FACTOR_REQUIRED], a refused or malformed code,
+     * an outage or throttling during that step): the session to retry the
+     * code on with [TutaClient.login]. Null when the sign-in must start over.
+     */
+    var pendingSession: TutaPendingSession? = null
+        internal set
+
     /** Sign-in, resuming, revoking: `login_failed`, `session_revoked`, `client_outdated`, ... */
     class Session internal constructor(code: TutaErrorCode) : TutaException(code, code.wire)
 
@@ -150,6 +165,10 @@ sealed class TutaException(
     class Unknown internal constructor(wireCode: String) : TutaException(TutaErrorCode.UNKNOWN, wireCode)
 
     companion object {
+        /** The exception for a wire code, carrying [pendingSession] when the reply had one. */
+        internal fun of(wireCode: String, pendingSession: TutaPendingSession?): TutaException =
+            of(wireCode).also { it.pendingSession = pendingSession }
+
         /** The exception for a wire code. */
         fun of(wireCode: String): TutaException {
             val code = TutaErrorCode.fromWire(wireCode)

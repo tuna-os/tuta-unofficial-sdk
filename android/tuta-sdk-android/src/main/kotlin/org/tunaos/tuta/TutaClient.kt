@@ -51,12 +51,24 @@ class TutaClient private constructor(private val native: TutaFfi) : AutoCloseabl
      */
     suspend fun rawRequest(request: String): String = native.request(request)
 
-    /** Sign in. A TOTP code is good for one sign-in. */
-    suspend fun login(email: String, password: String, totp: String? = null): TutaSession {
+    /**
+     * Sign in. When the account wants a second factor, a call without
+     * [totp] fails with [TutaErrorCode.SECOND_FACTOR_REQUIRED] and a
+     * [TutaException.pendingSession]: call again with the code and that
+     * [pending] session (also after a refused code), so the code completes
+     * the session Tuta already opened. A TOTP code is good for one sign-in.
+     */
+    suspend fun login(
+        email: String,
+        password: String,
+        totp: String? = null,
+        pending: TutaPendingSession? = null,
+    ): TutaSession {
         val result = call("login") {
             put("email", email)
             put("password", password)
             totp?.let { put("totp", it) }
+            pending?.let { put("pending_session", it.element) }
         }
         val session = result["session"] as? JsonObject ?: throw TutaException.of(TutaErrorCode.INCOMPLETE_RESPONSE.wire)
         return TutaSession.of(session)
@@ -233,7 +245,7 @@ class TutaClient private constructor(private val native: TutaFfi) : AutoCloseabl
                 val reply = TutaJson.parseToJsonElement(line).jsonObject
                 val error = reply["error"]
                 if (error != null) {
-                    close(TutaException.of(error.jsonObject.getValue("code").jsonPrimitive.content))
+                    close(failure(error.jsonObject))
                     false
                 } else {
                     val event = TutaWatchEvent.of(reply)
@@ -271,7 +283,7 @@ class TutaClient private constructor(private val native: TutaFfi) : AutoCloseabl
 
     private fun result(line: String): JsonObject {
         val reply = TutaJson.parseToJsonElement(line).jsonObject
-        reply["error"]?.let { throw TutaException.of(it.jsonObject.getValue("code").jsonPrimitive.content) }
+        reply["error"]?.let { throw failure(it.jsonObject) }
         return reply["result"] as? JsonObject ?: throw TutaException.of(TutaErrorCode.INCOMPLETE_RESPONSE.wire)
     }
 
@@ -294,6 +306,11 @@ class TutaClient private constructor(private val native: TutaFfi) : AutoCloseabl
             ?: throw TutaException.of(TutaErrorCode.INCOMPLETE_RESPONSE.wire)
 
     private fun strings(values: List<String>) = JsonArray(values.map(::JsonPrimitive))
+
+    private fun failure(error: JsonObject): TutaException = TutaException.of(
+        error.getValue("code").jsonPrimitive.content,
+        (error["pending_session"] as? JsonObject)?.let(::TutaPendingSession),
+    )
 
     companion object {
         /** The protocol version this layer speaks. */
