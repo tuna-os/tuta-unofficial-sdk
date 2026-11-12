@@ -24,7 +24,7 @@ tutabridge-tuta = { path = "../../prepared/crates/tuta" }
 crypto-primitives = { path = "../../prepared/sdk/generated/tuta-sdk/rust/crypto-primitives" }
 rand_core = "0.6"
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 # MIME parsing for `import`, the version and features the official desktop

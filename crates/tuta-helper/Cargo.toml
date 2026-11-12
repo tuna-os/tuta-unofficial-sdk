@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 tuta-unofficial-sdk = { path = "../tuta-unofficial-sdk" }
-base64 = "0.22"
+base64 = "0.23"
 futures-core = "0.3"
 libc = "0.2"
 secrecy = { version = "0.10", features = ["serde"] }
