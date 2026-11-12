@@ -26,17 +26,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          # Tag builds feed the release: they do not restore a cache.
+          lookup-only: ${{ startsWith(github.ref, 'refs/tags/') }}
 
       - name: Prepare the Tuta SDK
         # sdk-prepare.py runs git in the submodules.
@@ -66,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -78,7 +81,7 @@ jobs:
           git config --global --add safe.directory '*'
           sh prepare.sh
 
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check
           arguments: --all-features
@@ -88,11 +91,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Regenerate and compare
         run: |
@@ -109,24 +112,29 @@ jobs:
       ANDROID_PACKAGES: platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
       CARGO_NDK_VERSION: 4.1.2
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
-      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+      - uses: actions/setup-java@v6.2.0
         with:
           distribution: temurin
           java-version: '21'
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: aarch64-linux-android, x86_64-linux-android
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          # Tag builds feed the release: they do not restore a cache.
+          lookup-only: ${{ startsWith(github.ref, 'refs/tags/') }}
 
-      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          cache-disabled: ${{ startsWith(github.ref, 'refs/tags/') }}
 
       - name: Install the Android SDK packages and cargo-ndk
         run: |
@@ -149,7 +157,7 @@ jobs:
         working-directory: android
         run: ./gradlew --no-daemon :tuta-sdk-android:dist
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: tuta-sdk-android
           path: android/tuta-sdk-android/build/dist/
@@ -164,7 +172,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: tuta-sdk-android
           path: dist
