@@ -10,6 +10,24 @@
         "github-actions"
       ],
       "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Cargo.lock can only be regenerated after prepare.sh has written prepared/ from the upstream/ submodule, which Renovate does not run: list cargo updates on the Dependency Dashboard instead of opening PRs whose lock file is stale. Update locally with `sh prepare.sh && cargo update -p <crate> && scripts/cargo-sources.sh`.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "These follow the pinned Tuta SDK, not this repository: tuta-sdk links uniffi at the same revision (one scaffolding ABI), and crypto-primitives takes our rand_core::OsRng. They move with upstream/.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "uniffi",
+        "rand_core"
+      ],
+      "enabled": false
     }
   ]
 }
