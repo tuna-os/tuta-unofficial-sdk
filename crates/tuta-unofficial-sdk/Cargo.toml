@@ -22,7 +22,7 @@ tutabridge-tuta = { path = "../../prepared/crates/tuta" }
 # The SDK's own public crypto (session keys, attachment encryption), from the
 # same prepared tree as tuta-sdk: MailFacade exposes no send API at this pin.
 crypto-primitives = { path = "../../prepared/sdk/generated/tuta-sdk/rust/crypto-primitives" }
-rand_core = "0.6"
+rand_core = "0.10"
 async-trait = "0.1"
 base64 = "0.22"
 futures-core = "0.3"
