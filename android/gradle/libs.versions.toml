@@ -1,7 +1,7 @@
 # Versions follow the Tuna Mail fork of Thunderbird for Android, which
 # consumes this library (its gradle/libs.versions.toml and ProjectConfig).
 [versions]
-androidGradlePlugin = "9.5.0"
+androidGradlePlugin = "9.5.1"
 jna = "5.19.1"
 junit = "4.13.2"
 kotlin = "2.4.21"
