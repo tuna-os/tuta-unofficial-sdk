@@ -16,4 +16,4 @@ name = "uniffi-bindgen"
 path = "src/main.rs"
 
 [dependencies]
-uniffi = { git = "https://github.com/mozilla/uniffi-rs.git", rev = "13a1c559cb3708eeca40dcf95dc8b3ccccf3b88c", default-features = false, features = ["cli"] }
+uniffi = { git = "https://github.com/mozilla/uniffi-rs.git", rev = "482095c1ba1b76a1393b582e0589e2fdc9c64b14", default-features = false, features = ["cli"] }
