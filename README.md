@@ -834,7 +834,10 @@ went from 12.3 MB (0.2.1) to 7.1 MB (0.3.0), with `libtuta_ffi` at 7.6 MB
 
 ## Building and testing
 
-With a Rust toolchain (1.84 or newer), a C compiler, Python 3 and git:
+With a current stable Rust toolchain (CI builds with the latest stable; the
+locked dependencies need 1.88 or newer), a C compiler, Python 3 and git,
+plus [cargo-deny](https://github.com/EmbarkStudios/cargo-deny)
+(`cargo install --locked cargo-deny`) for the last command:
 
 ```sh
 git clone --recursive https://github.com/tuna-os/tuta-unofficial-sdk
