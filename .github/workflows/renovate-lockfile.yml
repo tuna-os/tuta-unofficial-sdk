@@ -1,0 +1,72 @@
+name: renovate-lockfile
+
+# Renovate cannot run cargo in this repository: the workspace builds against
+# prepared/, which prepare.sh generates, so its Cargo.lock update fails
+# (renovate/artifacts) and CI's --locked steps then stop on a stale lock. On
+# Renovate's own Cargo branches, bring Cargo.lock and cargo-sources.json in
+# step with the bumped Cargo.toml and push the result.
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - crates/*/Cargo.toml
+
+permissions: {}
+
+concurrency:
+  group: renovate-lockfile-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # Only Renovate's same-repository branches: this job holds a write token.
+    if: >-
+      github.event.pull_request.user.login == 'renovate[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: write
+    env:
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Prepare the Tuta SDK
+        run: |
+          git config --global --add safe.directory '*'
+          sh prepare.sh
+
+      - name: Update Cargo.lock and cargo-sources.json
+        run: |
+          cargo update --workspace
+          scripts/cargo-sources.sh cargo-sources.json
+
+      - name: Push, then start the checks
+        run: |
+          if git diff --quiet -- Cargo.lock cargo-sources.json; then
+            echo "Cargo.lock and cargo-sources.json already match."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock cargo-sources.json
+          git commit -s -m 'chore(deps): update Cargo.lock and cargo-sources.json'
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          # A push made with GITHUB_TOKEN starts no pull_request run, but a
+          # workflow_dispatch does.
+          gh workflow run ci.yml --ref "$BRANCH"
+          gh workflow run actions-security.yml --ref "$BRANCH"
