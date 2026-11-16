@@ -29,7 +29,7 @@ futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 # MIME parsing for `import`, the version and features the official desktop
 # importer (tutanota `src/app-kit/mimimi`) uses, so its conversion ports as is.
-mail-parser = { version = "0.10.2", features = ["full_encoding"] }
+mail-parser = { version = "1.0.0", features = ["full_encoding"] }
 # Session tokens, wrapped keys and recipient passwords.
 secrecy = "0.10"
 zeroize = "1"
