@@ -488,6 +488,8 @@ async fn resume(client: &Client, saved: SavedSession) -> Result<Session> {
     client.resume(saved).await
 }
 
+// Over the function-length ratchet (#35): split it rather than grow it.
+#[allow(clippy::too_many_lines)]
 async fn run(client: &Client, operation: Operation) -> Result<Value> {
     match operation {
         Operation::Login { .. } => unreachable!("dispatch handles login"),

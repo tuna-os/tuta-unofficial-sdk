@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 # A package of its own rather than a binary of tuta-ffi: enabling uniffi's
 # `cli` feature there would rebuild the whole SDK each time a build switched
 # between the library and the generator.

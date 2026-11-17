@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [lib]
 name = "tuta_ffi"
 # cdylib: libtuta_ffi.so for JNA (Android jniLibs, host JVM tests); lib: the

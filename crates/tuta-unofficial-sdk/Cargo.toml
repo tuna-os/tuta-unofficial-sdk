@@ -13,6 +13,9 @@ categories = ["email", "api-bindings"]
 # to crates.io; consume it as a git dependency or a submodule.
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # All three come from prepared/, which prepare.sh writes: TutaBridge's pinned
 # SDK with this repository's sdk-patches/ applied, and TutaBridge's crate
