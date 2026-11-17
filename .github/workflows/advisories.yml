@@ -1,0 +1,37 @@
+name: advisories
+
+# cargo-deny's advisory check on a schedule. ci.yml runs it only on a push,
+# so an advisory published against a locked crate would otherwise wait for
+# the next commit. The released AAR is built from Cargo.lock, and an app
+# that consumes it has no lock file of its own to check.
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Prepare the Tuta SDK
+        # cargo-deny reads `cargo metadata`, which needs the prepared path
+        # crates to exist.
+        run: |
+          git config --global --add safe.directory '*'
+          sh prepare.sh
+
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check advisories
+          arguments: --all-features
