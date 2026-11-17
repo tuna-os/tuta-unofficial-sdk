@@ -31,10 +31,10 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default stable
 
       - uses: Swatinem/rust-cache@v2.9.3
         with:
@@ -122,10 +122,10 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: aarch64-linux-android, x86_64-linux-android
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android --target x86_64-linux-android --no-self-update
+          rustup default stable
 
       - uses: Swatinem/rust-cache@v2.9.3
         with:
