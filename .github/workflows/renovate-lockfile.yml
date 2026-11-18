@@ -5,6 +5,11 @@ name: renovate-lockfile
 # (renovate/artifacts) and CI's --locked steps then stop on a stale lock. On
 # Renovate's own Cargo branches, bring Cargo.lock and cargo-sources.json in
 # step with the bumped Cargo.toml and push the result.
+#
+# Two jobs, so the write token never shares a runner with code from outside
+# this repository: `resolve` runs prepare.sh, cargo and the PyPI packages
+# cargo-sources.sh installs with a read-only token, and `push` only copies
+# the two files it produced onto the branch.
 
 on:
   pull_request:
@@ -19,23 +24,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  sync:
-    # Only Renovate's same-repository branches: this job holds a write token.
+  resolve:
+    # Only Renovate's same-repository branches.
     if: >-
       github.event.pull_request.user.login == 'renovate[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
-      actions: write
-    env:
-      BRANCH: ${{ github.event.pull_request.head.ref }}
-      GH_TOKEN: ${{ github.token }}
+      contents: read
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
+          # The commit this run was started for, in both jobs: if the branch
+          # has moved since, the push below is refused and the newer run
+          # does the work.
+          ref: ${{ github.event.pull_request.head.sha }}
           submodules: recursive
           persist-credentials: false
 
@@ -56,8 +60,48 @@ jobs:
           cargo update --workspace
           scripts/cargo-sources.sh cargo-sources.json
 
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: lockfiles
+          path: |
+            Cargo.lock
+            cargo-sources.json
+          if-no-files-found: error
+          retention-days: 1
+
+  push:
+    # This job holds a write token, so it runs nothing from the branch and
+    # installs nothing: it takes the two files as data.
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: lockfiles
+          path: ${{ runner.temp }}/lockfiles
+
       - name: Push, then start the checks
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
+          LOCKFILES: ${{ runner.temp }}/lockfiles
         run: |
+          for file in Cargo.lock cargo-sources.json; do
+            if [ ! -f "$LOCKFILES/$file" ] || [ -L "$LOCKFILES/$file" ]; then
+              echo "$file is not a plain file in the artifact" >&2
+              exit 1
+            fi
+            cp "$LOCKFILES/$file" "$file"
+          done
           if git diff --quiet -- Cargo.lock cargo-sources.json; then
             echo "Cargo.lock and cargo-sources.json already match."
             exit 0
