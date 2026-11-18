@@ -2533,7 +2533,7 @@ dependencies = [
 name = "tuta-helper"
 version = "0.3.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-core",
  "libc",
  "secrecy",
@@ -2592,7 +2592,7 @@ name = "tuta-unofficial-sdk"
 version = "0.3.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "crypto-primitives",
  "futures-core",
  "mail-parser",
