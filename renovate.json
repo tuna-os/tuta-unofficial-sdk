@@ -19,13 +19,14 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "These follow the pinned Tuta SDK, not this repository: tuta-sdk links uniffi at the same revision (one scaffolding ABI), and crypto-primitives takes our rand_core::OsRng. They move with upstream/.",
+      "description": "These follow the pinned Tuta SDK, not this repository: tuta-sdk links uniffi at the same revision (one scaffolding ABI), crypto-primitives takes our rand_core::OsRng, and we call the SDK's util::BASE64_EXT engine through the base64 Engine trait, so our base64 must be the version the SDK builds against. They move with upstream/.",
       "matchManagers": [
         "cargo"
       ],
       "matchPackageNames": [
         "uniffi",
-        "rand_core"
+        "rand_core",
+        "base64"
       ],
       "enabled": false
     }
