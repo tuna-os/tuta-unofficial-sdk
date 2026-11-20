@@ -44,13 +44,16 @@ yanked = "warn"
 # vulnerable.
 unmaintained = "none"
 ignore = [
-    # RUSTSEC-2023-0071 (rsa Marvin timing sidechannel): no fixed release
-    # exists -- patched = [] is intentional and latest stable is still
-    # affected. The SDK's RSA is used locally (decrypting legacy keys and
-    # wrapping for RSA recipients), never as a network-observable
-    # decryption oracle, matching the advisory's own "local use is fine"
-    # workaround. Re-check 2027-05-01.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed release available; local-only use per advisory workarounds; re-check 2027-05-01" },
+    # RUSTSEC-2023-0071 (rsa Marvin timing sidechannel): fixed in rsa 0.10.0
+    # (2026-11-08). The locked rsa 0.9.10 comes in through the pinned Tuta
+    # SDK alone (tuta-sdk), which this workspace does not version, so it
+    # moves when upstream/ takes an SDK built against rsa 0.10. Until then
+    # the exposure is what it was: the SDK's RSA is used locally (decrypting
+    # legacy keys and wrapping for RSA recipients), never as a
+    # network-observable decryption oracle. That is this workspace's own
+    # assessment; the advisory no longer lists a workaround. Re-check at
+    # every upstream/ bump, and by 2027-02-01 (#44).
+    { id = "RUSTSEC-2023-0071", reason = "fixed in rsa 0.10.0; the locked 0.9.10 follows the pinned Tuta SDK; local-only use; re-check at each upstream/ bump and by 2027-02-01 (#44)" },
 ]
 
 [bans]
