@@ -378,6 +378,26 @@ mod tests {
         assert_eq!(Error::from_code("not_attempted"), None);
     }
 
+    /// The README's Error codes section is the protocol's list of codes:
+    /// a code missing there is one a client written from it cannot know.
+    #[test]
+    fn every_code_is_in_the_readme() {
+        let readme = include_str!("../../../README.md");
+        let (_, section) = readme
+            .split_once("### Error codes")
+            .expect("the Error codes section");
+        let section = section
+            .split_once("\n#")
+            .map_or(section, |(section, _)| section);
+        for error in Error::ALL {
+            assert!(
+                section.contains(&format!("`{}`", error.code())),
+                "README.md's Error codes section does not list `{}`",
+                error.code()
+            );
+        }
+    }
+
     #[test]
     fn resume_distinguishes_revoked_outage_and_refused_version() {
         let token = || LoginError::InvalidAccessToken {
