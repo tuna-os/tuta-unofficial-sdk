@@ -54,6 +54,21 @@ ignore = [
     # assessment; the advisory no longer lists a workaround. Re-check at
     # every upstream/ bump, and by 2027-02-01 (#44).
     { id = "RUSTSEC-2023-0071", reason = "fixed in rsa 0.10.0; the locked 0.9.10 follows the pinned Tuta SDK; local-only use; re-check at each upstream/ bump and by 2027-02-01 (#44)" },
+    # RUSTSEC-2026-0585 (pqcrypto-mlkem leaves out the FIPS 203 checks on
+    # encapsulation and decapsulation keys): no fixed release, and none is
+    # expected, since the crate is unmaintained. It comes in through the
+    # pinned Tuta SDK alone (tuta-sdk), so it goes when upstream/ takes an
+    # SDK on a maintained ML-KEM. The SDK does reach both functions:
+    # TutaCrypt wraps a mail's bucket key for the recipient's key and
+    # unwraps with the account's own. This workspace's assessment is that no
+    # secret is exposed. The wrapping key is derived from two X25519 secrets
+    # as well as the ML-KEM one, over the recipient key's bytes as received.
+    # An encapsulation key comes from the Tuta server, which can already
+    # serve a well-formed key of its choice (recipient keys are not
+    # verified). A decapsulation key is the account's own, stored under an
+    # AES-256 key with a MAC. Re-check at every upstream/ bump, and by
+    # 2027-02-01 (#52).
+    { id = "RUSTSEC-2026-0585", reason = "no fixed release, crate unmaintained; follows the pinned Tuta SDK; the missing key checks expose no secret in TutaCrypt's hybrid key derivation; re-check at each upstream/ bump and by 2027-02-01 (#52)" },
 ]
 
 [bans]
