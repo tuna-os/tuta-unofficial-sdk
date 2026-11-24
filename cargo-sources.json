@@ -931,6 +931,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/encodify/encodify-1.0.3.crate",
+        "sha256": "ab7f638cb35e10aa08efd439d11ddcbeef7d52dd987c4956a6ff2cc1061020f3",
+        "dest": "cargo/vendor/encodify-1.0.3"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"ab7f638cb35e10aa08efd439d11ddcbeef7d52dd987c4956a6ff2cc1061020f3\", \"files\": {}}",
+        "dest": "cargo/vendor/encodify-1.0.3",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/encoding_rs/encoding_rs-0.8.44.crate",
         "sha256": "89253175e704ab869b04f9db224d38630e0211a53841a79181deae0889e169f5",
         "dest": "cargo/vendor/encoding_rs-0.8.44"
@@ -1295,14 +1308,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/hashify/hashify-0.2.9.crate",
-        "sha256": "dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26",
-        "dest": "cargo/vendor/hashify-0.2.9"
+        "url": "https://static.crates.io/crates/hashify/hashify-0.3.2.crate",
+        "sha256": "04a037b1848eada162d6534c206770180e6bfc0eaa97292250c3e7179d8b1f73",
+        "dest": "cargo/vendor/hashify-0.3.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26\", \"files\": {}}",
-        "dest": "cargo/vendor/hashify-0.2.9",
+        "contents": "{\"package\": \"04a037b1848eada162d6534c206770180e6bfc0eaa97292250c3e7179d8b1f73\", \"files\": {}}",
+        "dest": "cargo/vendor/hashify-0.3.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -1646,14 +1659,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/mail-parser/mail-parser-0.10.2.crate",
-        "sha256": "187a2b93c4c8c32f552ee06c2d99915e575de2fc7e04b07891c9edfee5b8edd6",
-        "dest": "cargo/vendor/mail-parser-0.10.2"
+        "url": "https://static.crates.io/crates/mail-parser/mail-parser-1.0.2.crate",
+        "sha256": "2e57f7caaeb0071026b4be388c81e9c253853d9ed072a3061d425ef1c1b1b569",
+        "dest": "cargo/vendor/mail-parser-1.0.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"187a2b93c4c8c32f552ee06c2d99915e575de2fc7e04b07891c9edfee5b8edd6\", \"files\": {}}",
-        "dest": "cargo/vendor/mail-parser-0.10.2",
+        "contents": "{\"package\": \"2e57f7caaeb0071026b4be388c81e9c253853d9ed072a3061d425ef1c1b1b569\", \"files\": {}}",
+        "dest": "cargo/vendor/mail-parser-1.0.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {
