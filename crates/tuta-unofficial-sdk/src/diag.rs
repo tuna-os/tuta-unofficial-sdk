@@ -142,6 +142,21 @@ mod tests {
     }
 
     #[test]
+    fn redaction_thresholds_are_exact() {
+        // An id needs eight characters and a digit.
+        assert_eq!(redact("abcdef1"), "abcdef1");
+        assert_eq!(redact("abcdefg1"), "<redacted>");
+        assert_eq!(redact("abcdefghij"), "abcdefghij");
+        // A byte list needs four numbers and nothing else.
+        assert_eq!(redact("[1, 2, 3]"), "[1, 2, 3]");
+        assert_eq!(redact("[1, 2, 3, 4]"), "[<bytes>]");
+        assert_eq!(redact("[1, 2, 3, x]"), "[1, 2, 3, x]");
+        assert_eq!(redact("[1, 2, 3, 4"), "[1, 2, 3, 4");
+        // Text after a list is still scanned.
+        assert_eq!(redact("[1,2,3,4] then a@b.c"), "[<bytes>] then <address>");
+    }
+
+    #[test]
     fn error_names_and_paths_survive() {
         let text = "POST /rest/tutanota/senddraftservice -> 412 ServerResponseError { \
                     source: PreconditionFailedError(None) } [1, 2]";

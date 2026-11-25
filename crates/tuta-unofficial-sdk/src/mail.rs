@@ -529,6 +529,35 @@ mod tests {
     }
 
     #[test]
+    fn every_system_folder_type_has_its_role_and_label() {
+        for (kind, role, label) in [
+            (0, FolderRole::Other, "Folder"),
+            (1, FolderRole::Inbox, "Inbox"),
+            (2, FolderRole::Sent, "Sent"),
+            (3, FolderRole::Trash, "Trash"),
+            (4, FolderRole::Archive, "Archive"),
+            (5, FolderRole::Junk, "Spam"),
+            (6, FolderRole::Drafts, "Drafts"),
+        ] {
+            assert_eq!(FolderRole::of(kind), (role, label), "type {kind}");
+        }
+    }
+
+    #[test]
+    fn a_nested_folder_names_its_parent_on_the_wire() {
+        let folder = Folder {
+            id: Id::parse("f/2").unwrap(),
+            role: FolderRole::Archive,
+            label: "2024".into(),
+            parent: Some(Id::parse("f/1").unwrap()),
+        };
+        assert_eq!(
+            serde_json::to_value(&folder).unwrap(),
+            json!({"id": "f/2", "role": "archive", "label": "2024", "parent": "f/1"})
+        );
+    }
+
+    #[test]
     fn batch_outcomes_report_the_successful_prefix() {
         let ids = ids(&["a/a", "b/b", "c/c"]);
         let codes = |rows: Vec<IdOutcome>| -> Vec<Value> {
