@@ -31,7 +31,7 @@ jobs:
           git config --global --add safe.directory '*'
           sh prepare.sh
 
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.3
         with:
           command: check advisories
           arguments: --all-features
